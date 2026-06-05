@@ -1,8 +1,9 @@
 app:
   name: openclaw-voice-control
-  platform: macos
+  platform: windows
   log_dir: logs
   runtime_dir: runtime
+  log_level: INFO
 
 openclaw:
   base_url: ${OPENCLAW_BASE_URL}
@@ -29,24 +30,24 @@ wakeword:
   model_name: hey jarvis
   model_path:
   keyword_path:
-  threshold: 0.65
+  threshold: 0.35
   cooldown_seconds: 1.5
   rearm_seconds_after_turn: 0.0
 
 tts:
-  engine: macos_say
-  voice: Tingting
+  engine: windows_sapi5
+  voice: zh-CN-HUIHUI
   wake_ack: 我在
-  followup_beep_enabled: true
-  followup_beep_sound: /System/Library/Sounds/Glass.aiff
-  record_done_beep_enabled: true
-  record_done_sound: /System/Library/Sounds/Funk.aiff
-  no_speech_beep_enabled: true
-  no_speech_sound: /System/Library/Sounds/Pop.aiff
-  post_reply_delay: 0.05
+  followup_beep_enabled: false
+  followup_beep_sound:
+  record_done_beep_enabled: false
+  record_done_sound:
+  no_speech_beep_enabled: false
+  no_speech_sound:
+  post_reply_delay: 0.5
 
 overlay:
-  enabled: true
+  enabled: false
   state_file: runtime/overlay_state.json
   stop_flag_file: runtime/stop_tts.flag
   poll_interval_ms: 150

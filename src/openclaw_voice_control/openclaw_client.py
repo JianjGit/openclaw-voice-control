@@ -1,43 +1,31 @@
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass
-
-import requests
+from typing import Callable
 
 from .config import OpenClawConfig
+from .gateway_ws import GatewayWebSocket
 
 
 @dataclass(slots=True)
 class OpenClawClient:
     config: OpenClawConfig
+    _ws: GatewayWebSocket | None = None
 
     def ask(self, user_text: str) -> str:
-        headers = {
-            "Authorization": f"Bearer {self.config.token}",
-            "Content-Type": "application/json",
-            "x-openclaw-agent-id": self.config.agent_id,
-        }
-        payload = {
-            "model": self.config.model,
-            "user": self.config.user,
-            "messages": [{"role": "user", "content": user_text}],
-            "stream": False,
-        }
+        """Blocking call: send message, wait for full reply, return text."""
+        if self._ws is None:
+            self._ws = GatewayWebSocket(self.config)
+        return self._ws.chat_send_streaming(user_text, on_sentence=None)
 
-        started_at = time.time()
-        response = requests.post(
-            self.config.base_url,
-            headers=headers,
-            json=payload,
-            timeout=self.config.timeout_seconds,
-        )
-        response.raise_for_status()
-        _ = time.time() - started_at
+    def ask_streaming(self, user_text: str, on_sentence: Callable[[str], None]) -> str:
+        """Streaming call: send message, deliver each complete sentence via callback,
+        return full text when done."""
+        if self._ws is None:
+            self._ws = GatewayWebSocket(self.config)
+        return self._ws.chat_send_streaming(user_text, on_sentence=on_sentence)
 
-        data = response.json()
-        try:
-            return data["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError, TypeError):
-            return json.dumps(data, ensure_ascii=False, indent=2)
+    def close(self) -> None:
+        if self._ws is not None:
+            self._ws.close()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,7 +13,17 @@ class FunASRSenseVoice:
     _model: Any | None = None
     _postprocess: Any | None = field(default=None, init=False)
 
+    @staticmethod
+    def _ensure_ffmpeg_on_path() -> None:
+        """Add ffmpeg directory to PATH before funasr imports."""
+        ffmpeg_dir = os.environ.get("FFMPEG_PATH", "")
+        if ffmpeg_dir and os.path.isdir(ffmpeg_dir):
+            norm = os.path.normpath(ffmpeg_dir)
+            if norm not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = norm + os.pathsep + os.environ.get("PATH", "")
+
     def load(self) -> None:
+        self._ensure_ffmpeg_on_path()
         if self._model is not None:
             return
 
@@ -46,7 +57,7 @@ class FunASRSenseVoice:
             input=wav_path,
             language=self.config.language,
             use_itn=True,
-            batch_size_s=60,
+            batch_size_s=10,
         )
         if not result:
             return ""

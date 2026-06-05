@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import wave
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -18,7 +21,7 @@ from .config import VoiceControlConfig
 from .openclaw_client import OpenClawClient
 from .state import OverlayStateManager
 from .text import clean_text_for_overlay
-from .tts import MacOSTTS
+from .tts import WindowsTTS
 from .wakeword import build_wakeword_engine
 
 
@@ -30,8 +33,9 @@ class VoiceControlService:
 
         self.logger = self._build_logger()
         self.client = OpenClawClient(config.openclaw)
-        self.tts = MacOSTTS(config.tts, config.overlay)
+        self.tts = WindowsTTS(config.tts, config.overlay)
         self.asr = FunASRSenseVoice(config.asr)
+        self.asr_lock = threading.Lock()
         self.wakeword = build_wakeword_engine(config.wakeword)
         self.state = OverlayStateManager(config.overlay)
 
@@ -70,7 +74,7 @@ class VoiceControlService:
         if logger.handlers:
             return logger
 
-        logger.setLevel(logging.INFO)
+        logger.setLevel(getattr(logging, self.config.app.log_level, logging.INFO))
         logger.propagate = False
         formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
@@ -212,6 +216,7 @@ class VoiceControlService:
     def handle_one_turn(self, wav_path: str) -> bool:
         try:
             user_text = self.asr.transcribe(wav_path)
+            self.logger.info("ASR: %s", user_text[:100] if user_text else "(empty)")
             if not user_text:
                 self.update_overlay_state("no_speech", meta_text="没有识别出有效文本", auto_hide_ms=2200)
                 self.tts.clear_stop_flag()
@@ -220,20 +225,30 @@ class VoiceControlService:
             self.update_overlay_state("recognized", user_text=user_text, meta_text="识别完成", auto_hide_ms=1800)
             self.update_overlay_state("thinking", user_text=user_text, meta_text="正在思考", auto_hide_ms=0)
 
-            reply = self.client.ask(user_text)
+            # Streaming reply with sentence queue: enqueue sentences for progressive TTS
+            self.tts.clear_stop_flag()
+
+            def on_sentence(sentence: str) -> None:
+                self.tts.enqueue(sentence)
+
+            reply = self.client.ask_streaming(user_text, on_sentence=on_sentence)
+            self.logger.info("Reply: %s", reply[:100] if reply else "(empty)")
+
             if self.tts.is_stop_requested():
                 self.update_overlay_state("idle", auto_hide_ms=120)
                 return False
+
             reply_clean = clean_text_for_overlay(reply)
             self.update_overlay_state("reply", user_text=user_text, reply_text=reply_clean, meta_text="Jarvis", auto_hide_ms=0)
 
-            finished = self.tts.speak(reply, clean_markdown=True)
-            if finished:
+            # Wait for queued sentences to finish playing
+            self.tts.wait_done()
+            if reply:
                 time.sleep(self.config.tts.post_reply_delay)
 
             self.update_overlay_state("idle", auto_hide_ms=120)
             self.tts.clear_stop_flag()
-            return finished
+            return True
         except requests.HTTPError:
             self.logger.exception("OpenClaw request failed")
             self.update_overlay_state("no_speech", meta_text="请求失败", auto_hide_ms=2200)
@@ -254,10 +269,58 @@ class VoiceControlService:
                 except Exception:
                     self.logger.exception("Failed to remove temp wav file: %s", wav_path)
 
-    def run(self) -> None:
-        if self.config.app.platform != "macos":
-            raise RuntimeError("This first public release is intentionally limited to macOS.")
+    def _start_stt_http_server(self, host: str = "127.0.0.1", port: int = 15900) -> None:
+        """启动 STT HTTP 接口（常驻守护线程），供 OpenClaw 的 tools.media.audio CLI 调用。"""
+        service_ref = self
 
+        class STTHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                if self.path != "/stt":
+                    self.send_error(404)
+                    return
+                try:
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(content_length)
+                    data = json.loads(body)
+                    audio_path = data.get("path", "")
+                    if not audio_path or not os.path.isfile(audio_path):
+                        self.send_error(400, "Missing or invalid path")
+                        return
+                    with service_ref.asr_lock:
+                        text = service_ref.asr.transcribe(audio_path)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"text": text}, ensure_ascii=False).encode("utf-8"))
+                except Exception:
+                    service_ref.logger.exception("STT HTTP error")
+                    self.send_error(500)
+
+            def log_message(self, format, *args):
+                pass  # 静默，不往 stderr 打 access log
+
+        server = HTTPServer((host, port), STTHandler)
+        service_ref.logger.info("STT HTTP server listening on http://%s:%d/stt", host, port)
+        server.serve_forever()
+
+    def run(self) -> None:
+        try:
+            self._run_service()
+        except Exception:
+            self.logger.exception("FATAL: service crashed, writing crash dump...")
+            crash_log = self.config.app.log_dir / "crash.log"
+            import traceback
+            with open(str(crash_log), "w", encoding="utf-8") as f:
+                f.write("=" * 60 + "\n")
+                f.write("Voice Control Crash Report\n")
+                f.write("=" * 60 + "\n")
+                traceback.print_exc(file=f)
+            self.logger.info("Crash dump written to %s", str(crash_log))
+            raise
+        finally:
+            self.client.close()
+
+    def _run_service(self) -> None:
         self.logger.info(
             "Starting voice control service | platform=%s asr_model=%s language=%s",
             self.config.app.platform,
@@ -267,6 +330,8 @@ class VoiceControlService:
         self.logger.info("Loading ASR model...")
         self.asr.load()
         self.logger.info("ASR model ready")
+        stt_thread = threading.Thread(target=self._start_stt_http_server, daemon=True)
+        stt_thread.start()
         self._start_wakeword_engine()
         self.tts.clear_stop_flag()
         self.state.ensure_idle_state(reset=True)
@@ -328,39 +393,8 @@ class VoiceControlService:
                 continue
 
             success = self.handle_one_turn(wav_path)
-            if not success:
-                extend_rearm(self.config.wakeword.rearm_seconds_after_turn)
-                wakeword_armed = True
-                self._start_wakeword_engine()
-                self._return_to_idle(auto_hide_ms=120)
-                continue
-
-            while True:
-                if self.tts.is_stop_requested():
-                    extend_rearm(self.config.wakeword.rearm_seconds_after_turn)
-                    wakeword_armed = True
-                    self._start_wakeword_engine()
-                    self._return_to_idle(auto_hide_ms=120, clear_stop_flag=True)
-                    break
-
-                if self.config.tts.followup_beep_enabled:
-                    self.tts.play_sound_async(self.config.tts.followup_beep_sound)
-
-                followup_wav = self.record_until_silence()
-                if not followup_wav:
-                    extend_rearm(self.config.wakeword.rearm_seconds_after_turn)
-                    wakeword_armed = True
-                    self._start_wakeword_engine()
-                    self._return_to_idle(auto_hide_ms=200)
-                    break
-
-                if not self.handle_one_turn(followup_wav):
-                    extend_rearm(self.config.wakeword.rearm_seconds_after_turn)
-                    wakeword_armed = True
-                    self._start_wakeword_engine()
-                    self._return_to_idle(auto_hide_ms=120)
-                    break
-
-                extend_rearm(self.config.wakeword.rearm_seconds_after_turn)
-            else:
-                continue
+            # No follow-up loop — return directly to wakeword listening after each turn
+            extend_rearm(self.config.wakeword.rearm_seconds_after_turn)
+            wakeword_armed = True
+            self._start_wakeword_engine()
+            self._return_to_idle(auto_hide_ms=120)

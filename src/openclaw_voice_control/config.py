@@ -19,16 +19,20 @@ class AppConfig:
     base_dir: Path
     log_dir: Path
     runtime_dir: Path
+    log_level: str
 
 
 @dataclass(slots=True)
 class OpenClawConfig:
     base_url: str
+    ws_url: str
     token: str
     agent_id: str
     model: str
     user: str
+    session_key: str
     timeout_seconds: int = 120
+    ws_timeout: int = 30
 
 
 @dataclass(slots=True)
@@ -223,21 +227,32 @@ def load_config(config_path: str | Path | None = None, env_path: str | Path | No
         base_dir=base_dir,
         log_dir=_resolve_path(base_dir, app.get("log_dir", "logs")),
         runtime_dir=_resolve_path(base_dir, app.get("runtime_dir", "runtime")),
+        log_level=app.get("log_level", "INFO").upper(),
     )
+
+    # Resolve base URL (strip old /v1/chat/completions suffix if present)
+    raw_base_url = _env_or_config(
+        "OPENCLAW_BASE_URL",
+        openclaw.get("base_url"),
+        "http://127.0.0.1:18789",
+    )
+    base_url_clean = raw_base_url.rstrip("/")
+    if base_url_clean.endswith("/v1/chat/completions"):
+        base_url_clean = base_url_clean[: -len("/v1/chat/completions")]
+    ws_url = base_url_clean.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
 
     return VoiceControlConfig(
         app=app_cfg,
         openclaw=OpenClawConfig(
-            base_url=_env_or_config(
-                "OPENCLAW_BASE_URL",
-                openclaw.get("base_url"),
-                "http://127.0.0.1:18789/v1/chat/completions",
-            ),
+            base_url=base_url_clean,
+            ws_url=ws_url,
             token=os.getenv("OPENCLAW_TOKEN", openclaw.get("token", "")),
             agent_id=_env_or_config("OPENCLAW_AGENT_ID", openclaw.get("agent_id"), "main"),
             model=_env_or_config("OPENCLAW_MODEL", openclaw.get("model"), "openclaw:main"),
             user=_env_or_config("OPENCLAW_USER", openclaw.get("user"), "openclaw-voice-control"),
+            session_key=_env_or_config("OPENCLAW_SESSION_KEY", openclaw.get("session_key"), "agent:main:main"),
             timeout_seconds=int(openclaw.get("timeout_seconds", 120)),
+            ws_timeout=int(openclaw.get("ws_timeout", 30)),
         ),
         audio=AudioConfig(
             sample_rate=int(audio.get("sample_rate", 16000)),
@@ -283,7 +298,7 @@ def load_config(config_path: str | Path | None = None, env_path: str | Path | No
             ),
         ),
         tts=TTSConfig(
-            engine=tts.get("engine", "macos_say"),
+            engine=tts.get("engine", "windows_sapi5"),
             voice=tts.get("voice", "Tingting"),
             wake_ack=tts.get("wake_ack", "我在"),
             followup_beep_enabled=bool(tts.get("followup_beep_enabled", True)),

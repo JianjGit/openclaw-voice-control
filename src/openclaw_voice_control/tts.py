@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-import subprocess
+import queue
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -11,43 +12,62 @@ from .state import OverlayStateManager
 from .text import clean_text_for_tts
 
 
+_SENTENCE_SPLIT = re.compile(r"([^。！？\n]+[。！？\n])")
+
+
 @dataclass(slots=True)
-class MacOSTTS:
+class WindowsTTS:
     config: TTSConfig
     overlay: OverlayConfig
-    _current_proc: subprocess.Popen | None = field(default=None, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _state: OverlayStateManager = field(init=False)
+    _stop_event: threading.Event = field(default_factory=threading.Event, init=False)
+    _voice: object | None = field(default=None, init=False)
+    _sentence_queue: "queue.Queue[str]" = field(default_factory=queue.Queue, init=False)
+    _player_thread: threading.Thread | None = field(default=None, init=False)
+    _player_ready: threading.Event = field(default_factory=threading.Event, init=False)
 
     def __post_init__(self) -> None:
         self._state = OverlayStateManager(self.overlay)
+        self._player_ready.set()  # player thread not running yet, but ready to accept
+        self._init_voice()
+
+    def _init_voice(self) -> None:
+        try:
+            import win32com.client
+            self._voice = win32com.client.Dispatch("SAPI.SpVoice")
+            self._voice.Rate = 1  # Slightly faster
+            self._voice.Volume = 100
+            # Set voice if available
+            for v in self._voice.GetVoices():
+                if self.config.voice.lower() in v.GetDescription().lower():
+                    self._voice.Voice = v
+                    break
+        except Exception:
+            self._voice = None
 
     def clear_stop_flag(self) -> None:
         self._state.clear_stop_flag()
+        self._stop_event.clear()
 
     def request_stop(self) -> None:
         self._state.request_stop()
+        self._stop_event.set()
 
     def is_stop_requested(self) -> bool:
-        return self._state.is_stop_requested()
+        return self._state.is_stop_requested() or self._stop_event.is_set()
 
     def stop_current_speech(self) -> None:
-        with self._lock:
-            proc = self._current_proc
-            if proc is None:
-                return
+        if self._voice is not None:
             try:
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=0.8)
-                    except Exception:
-                        proc.kill()
-            finally:
-                self._current_proc = None
+                self._voice.Skip("Sentence", 100)  # Skip all pending
+                self._voice.Speak("", 1)  # Clear
+            except Exception:
+                pass
+        self._stop_event.set()
 
     def speak(self, text: str, clean_markdown: bool = True) -> bool:
-        if not text:
+        if not text or self._voice is None:
             return True
 
         speak_text = clean_text_for_tts(text) if clean_markdown else text
@@ -55,29 +75,97 @@ class MacOSTTS:
             return True
 
         self.stop_current_speech()
+        self._stop_event.clear()
 
-        proc = subprocess.Popen(
-            ["say", "-v", self.config.voice, speak_text],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        with self._lock:
-            self._current_proc = proc
+        # Split into sentences for progressive playback
+        parts = _SENTENCE_SPLIT.findall(speak_text)
+        sentences = [s.strip() for s in parts if s.strip()]
+        # Include any remaining text after the last punctuation
+        consumed = len("".join(parts))
+        remainder = speak_text[consumed:].strip()
+        if remainder:
+            sentences.append(remainder)
+        if not sentences:
+            sentences = [speak_text.strip()]
 
-        while True:
-            result = proc.poll()
-            if result is not None:
-                with self._lock:
-                    if self._current_proc is proc:
-                        self._current_proc = None
-                return True
+        import logging
+        _log = logging.getLogger("openclaw.voice_control")
+        _log.debug("TTS: %d sentences to speak", len(sentences))
+        for i, sentence in enumerate(sentences):
+            _log.debug("TTS sentence %d/%d: [%s]", i+1, len(sentences), sentence[:60])
             if self.is_stop_requested():
-                self.stop_current_speech()
+                _log.info("TTS: stop requested before sentence %d", i+1)
                 self.clear_stop_flag()
                 return False
-            time.sleep(0.01)
+            try:
+                self._voice.Speak(sentence, 0)  # synchronous
+                _log.debug("TTS sentence %d done", i+1)
+            except Exception as exc:
+                _log.error("TTS Speak failed on sentence %d: %s", i+1, exc)
+        _log.info("TTS: all %d sentences finished", len(sentences))
+        return True
+
+    def enqueue(self, sentence: str) -> None:
+        """Push a sentence to the playback queue. Non-blocking."""
+        if not sentence or self._voice is None:
+            return
+        speak_text = clean_text_for_tts(sentence)
+        if not speak_text.strip():
+            return
+        self._sentence_queue.put(speak_text.strip())
+        # Start player thread if not already running
+        if self._player_thread is None or not self._player_thread.is_alive():
+            self._player_ready.clear()
+            self._player_thread = threading.Thread(target=self._play_queue, daemon=True)
+            self._player_thread.start()
+
+    def _play_queue(self) -> None:
+        """Dedicated single-threaded queue player. Runs until queue empty or stopped."""
+        import logging
+        _log = logging.getLogger("openclaw.voice_control")
+        try:
+            while True:
+                if self.is_stop_requested():
+                    # Drain remaining queue without playing
+                    while True:
+                        try:
+                            self._sentence_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                    break
+                try:
+                    sentence = self._sentence_queue.get(timeout=0.3)
+                except queue.Empty:
+                    break  # queue drained naturally
+                try:
+                    self._voice.Speak(sentence, 0)  # synchronous
+                    _log.debug("TTS queue spoke: [%s]", sentence[:40])
+                except Exception as exc:
+                    _log.error("TTS Speak failed in queue: %s", exc)
+        finally:
+            self._player_ready.set()
+
+    def wait_done(self, timeout: float = 30.0) -> None:
+        """Wait for the playback queue to be fully drained and spoken."""
+        self._player_ready.wait(timeout)
 
     def play_sound_async(self, sound_path: str) -> None:
         if not sound_path or not os.path.exists(sound_path):
             return
-        subprocess.Popen(["afplay", sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        threading.Thread(
+            target=lambda: self._play_sync(sound_path),
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _play_sync(sound_path: str) -> None:
+        try:
+            import winsound
+            winsound.PlaySound(sound_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        except Exception:
+            import subprocess
+            subprocess.Popen(
+                ["powershell", "-c", f"(New-Object Media.SoundPlayer '{sound_path}').PlaySync()"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
