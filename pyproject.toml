@@ -13,16 +13,11 @@ dependencies = [
   "numpy>=1.26",
   "openwakeword>=0.6.0",
   "PyYAML>=6.0",
-  "torchcodec>=0.1",
-  "pvporcupine>=3.0",
-  "pvrecorder>=1.2",
   "sounddevice>=0.5",
   "websockets>=15.0",
   "torch>=2.2",
   "torchaudio>=2.2",
   "pywin32>=306; sys_platform == 'win32'",
-  "comtypes>=1.4; sys_platform == 'win32'",
-  "edge-tts>=6.1",
 ]
 
 [project.scripts]
@@ -31,6 +26,14 @@ openclaw-voice-control = "openclaw_voice_control.cli:main"
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+]
+porcupine = [
+  "pvporcupine>=3.0",
+  "pvrecorder>=1.2",
+]
+tts-cli = [
+  "comtypes>=1.4; sys_platform == 'win32'",
+  "edge-tts>=6.1",
 ]
 
 [tool.setuptools]
