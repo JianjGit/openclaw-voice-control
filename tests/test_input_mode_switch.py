@@ -47,6 +47,36 @@ class FakeSpeech:
         self.clear_count += 1
 
 
+class FakeRuntime:
+    def is_stop_speech_requested(self) -> bool:
+        return False
+
+
+class DeferredSpeechItem:
+    def __init__(self) -> None:
+        self.completion = threading.Event()
+        self.error = None
+
+
+class DeferredSpeech:
+    def __init__(self) -> None:
+        self.callback = None
+        self.item = DeferredSpeechItem()
+
+    def clear_stop_request(self) -> None:
+        pass
+
+    def enqueue(self, _text: str, *, metadata=None, on_complete=None):
+        del metadata
+        self.callback = on_complete
+        return self.item
+
+    def finish(self) -> None:
+        assert self.callback is not None
+        self.callback(True, None)
+        self.item.completion.set()
+
+
 def make_service(*, mode: str = "wakeword") -> VoiceControlService:
     service = VoiceControlService.__new__(VoiceControlService)
     service.logger = FakeLogger()
@@ -115,6 +145,28 @@ def test_switch_is_pending_until_current_activity_finishes() -> None:
         "input_mode": "push_to_talk",
         "mode_change": "applied",
     }
+
+
+def test_async_speech_defers_switch_until_speech_completion() -> None:
+    service = make_service(mode="wakeword")
+    service.runtime = FakeRuntime()
+    speech = DeferredSpeech()
+    service.speech = speech
+
+    service.speak_message("正在朗读", wait=False)
+    assert service._active_operations == 1
+
+    assert service.set_input_mode("push_to_talk") is False
+    assert service.get_input_mode() == "wakeword"
+    assert service.get_pending_input_mode() == "push_to_talk"
+    assert service.wakeword.pause_count == 0
+
+    speech.finish()
+
+    assert service._active_operations == 0
+    assert service.get_input_mode() == "push_to_talk"
+    assert service.get_pending_input_mode() is None
+    assert service.wakeword.pause_count == 1
 
 
 def test_new_request_can_cancel_a_pending_switch() -> None:
