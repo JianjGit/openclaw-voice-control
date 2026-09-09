@@ -15,6 +15,14 @@ class QueuePresenter:
         self.events.put(event)
 
 
+def wait_until_ready(presenter: QueuePresenter, timeout: float = 120.0) -> None:
+    while True:
+        event = presenter.events.get(timeout=timeout)
+        print(event.kind.value, dict(event.metadata), event.text)
+        if event.kind.value == "idle" and event.metadata.get("source") == "startup":
+            return
+
+
 def set_mode(service: VoiceControlService, mode: str) -> dict[str, str | None]:
     applied = service.set_input_mode(mode)
     return {
@@ -39,6 +47,10 @@ def main() -> None:
     voice_thread.start()
 
     try:
+        # A real bridge should not accept microphone commands until the startup
+        # idle event confirms that ASR/STT/input-mode initialization is ready.
+        wait_until_ready(presenter)
+
         # In a real bridge these would be commands from the desktop pet.
         print(set_mode(service, "push_to_talk"))
 
