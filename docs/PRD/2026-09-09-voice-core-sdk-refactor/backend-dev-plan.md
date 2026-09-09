@@ -4,7 +4,7 @@
 
 - [x] BE-01 事件模型与 Presenter 协议 — `BE-T01` 通过，提交 `1dd11b8`。
 - [x] BE-02 RuntimeControl 与停止机制解耦 — `BE-T02` 通过，提交 `4d54bc1`。
-- [ ] BE-03 SpeechController 与 Windows TTS 重构
+- [x] BE-03 SpeechController 与 Windows TTS 重构 — `BE-T03` fake backend 语义测试通过，提交 `6cfef1f`；Windows SAPI 真机验证留待 BE-12。
 - [ ] BE-04 统一 ASR 与 STT HTTP 调用链
 - [ ] BE-05 统一 OpenClaw 文本对话入口
 - [ ] BE-06 外部主动朗读 API
@@ -112,7 +112,7 @@
 - 建立单一流式文本聚合/去重逻辑，保证一句只 enqueue 一次且顺序稳定。
 - 不为每个句子创建新的回调线程；由有序回调或单一队列向 SpeechController 交付。
 - 将 ACK、总响应等硬编码超时改为配置驱动。
-- 避免全局删除进程中的 proxy 环境变量，仅对目标连接做必要的代理禁用或显式连接配置。
+- 避免全局删除进程中的所有 proxy 环境变量，仅对 websocket 连接本身禁用代理，或在局部上下文处理。
 - 修复 WebSocket `close()` 生命周期，确保同步 wrapper 使用的 event loop 能真正关闭连接。
 - 将 OpenClaw session 根目录从硬编码盘符抽为可配置路径，并保留合理默认值。
 
