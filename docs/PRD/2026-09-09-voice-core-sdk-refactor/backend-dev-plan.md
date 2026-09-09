@@ -6,7 +6,7 @@
 - [x] BE-02 RuntimeControl 与停止机制解耦 — `BE-T02` 通过，提交 `4d54bc1`。
 - [x] BE-03 SpeechController 与 Windows TTS 重构 — `BE-T03` fake backend 语义测试通过，提交 `6cfef1f`；Windows SAPI 真机验证留待 BE-12。
 - [x] BE-04 统一 ASR 与 STT HTTP 调用链 — `BE-T04` 并发锁与 HTTP 契约测试通过，提交 `78d4bdd`。
-- [ ] BE-05 统一 OpenClaw 文本对话入口
+- [x] BE-05 统一 OpenClaw 文本对话入口 — `BE-T05` 事件顺序、speak=false、错误与 turn lock 测试通过，提交 `c06f740`。
 - [ ] BE-06 外部主动朗读 API
 - [ ] BE-07 VoiceControlService 主循环迁移
 - [ ] BE-08 Gateway WebSocket 与流式回复稳定化
@@ -77,7 +77,7 @@
 - `speak=True` 时继续支持 Gateway 流式逐句进入 TTS 队列；`speak=False` 时只返回文字结果，不触发 TTS。
 - 正常事件按协议输出：`thinking -> speaking(0..N) -> reply -> idle`；不朗读时为 `thinking -> reply -> idle`。
 - 空文本在进入 Gateway 前校验并拒绝。
-- 嵌入式公开 API 保留可处理的异常；独立 `run()` 在单轮边界捕获错误、发 `error -> idle` 后继续运行。
+- 嵌入式公开 API 保留可处理的异常；独立 `run()` 在单轮边界捕获异常、发 `error -> idle` 后继续运行。
 
 验收：不启动麦克风和 wakeword 也能完成一轮 OpenClaw 文本对话；事件顺序、返回值和 `speak=False` 行为与 API 文档一致。对应 `BE-T05`。
 
