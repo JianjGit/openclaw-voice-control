@@ -4,29 +4,70 @@ import asyncio
 import json
 import os
 import re
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from .config import OpenClawConfig
 
 
-# Sentence boundary pattern: split on Chinese/English punctuation + newline
-_SENTENCE_SPLIT = re.compile(r"([^。！？\n.!?]+[。！？\n.!?])")
+_SENTENCE_PATTERN = re.compile(r"[^。！？\n.!?]+[。！？\n.!?]")
+_NOISE_KEYWORDS = (
+    "Command still",
+    "FileNotFound",
+    "(no output)",
+    "Use process",
+    "No module",
+    "未找到文件",
+)
 
 
 def _extract_complete_sentences(buffer: str) -> tuple[list[str], str]:
-    """Split accumulated text into complete sentences + remaining fragment."""
-    sentences = _SENTENCE_SPLIT.findall(buffer)
-    if not sentences:
+    matches = list(_SENTENCE_PATTERN.finditer(buffer))
+    if not matches:
         return [], buffer
-    complete = [s.strip() for s in sentences if s.strip()]
-    consumed = len("".join(sentences))
-    remainder = buffer[consumed:].strip()
-    return complete, remainder
+    last_end = matches[-1].end()
+    sentences = [match.group(0).strip() for match in matches if match.group(0).strip()]
+    return sentences, buffer[last_end:]
+
+
+class ResponseAccumulator:
+    """Merge ordered response snapshots without re-emitting already delivered text."""
+
+    def __init__(self) -> None:
+        self.full_text = ""
+        self._emitted_chars = 0
+
+    def feed_snapshot(self, snapshot: str) -> list[str]:
+        snapshot = snapshot or ""
+        if not snapshot:
+            return []
+
+        previous = self.full_text
+        if snapshot == previous or previous.startswith(snapshot):
+            return []
+
+        if previous and not snapshot.startswith(previous):
+            emitted_prefix = previous[: self._emitted_chars]
+            if not snapshot.startswith(emitted_prefix):
+                # Do not let a conflicting source rewrite text that has already been spoken.
+                return []
+
+        self.full_text = snapshot
+        pending = self.full_text[self._emitted_chars :]
+        sentences, remainder = _extract_complete_sentences(pending)
+        if sentences:
+            consumed = len(pending) - len(remainder)
+            self._emitted_chars += consumed
+        return sentences
+
+    def flush(self) -> str:
+        remainder = self.full_text[self._emitted_chars :].strip()
+        self._emitted_chars = len(self.full_text)
+        return remainder
 
 
 @dataclass(slots=True)
@@ -36,84 +77,104 @@ class GatewayWebSocket:
     _connected: bool = field(default=False, init=False)
     _req_id: int = field(default=0, init=False)
     _loop: asyncio.AbstractEventLoop | None = field(default=None, init=False)
+    _pending_events: list[dict[str, Any]] = field(default_factory=list, init=False)
 
     def connect(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._connect_async())
+        if self._connected and self._ws is not None:
+            return
+        if self._loop is None or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+        try:
+            self._loop.run_until_complete(self._connect_async())
+        except Exception:
+            self.close()
+            raise
 
     async def _connect_async(self) -> None:
         import websockets
 
-        # Nuke ALL proxy env vars before any connection attempt
-        for key in list(os.environ.keys()):
-            if "proxy" in key.lower():
-                os.environ.pop(key, None)
-
-        ws_url = self.config.ws_url
-
         self._ws = await websockets.connect(
-            ws_url,
+            self.config.ws_url,
             max_size=2**24,
             proxy=None,
-            open_timeout=15,
+            open_timeout=float(self.config.ws_timeout),
             user_agent_header=None,
             additional_headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             },
-
         )
         self._connected = True
         self._req_id = 0
+        self._pending_events.clear()
 
-        # Receive connect.challenge
-        raw = await self._ws.recv()
+        raw = await asyncio.wait_for(self._ws.recv(), timeout=float(self.config.ws_timeout))
         challenge = json.loads(raw)
         if challenge.get("event") != "connect.challenge":
             raise RuntimeError(f"Expected connect.challenge, got: {challenge.get('event')}")
 
-        # Send connect with token auth
-        await self._send_async("connect", {
-            "minProtocol": 3, "maxProtocol": 3,
-            "client": {"id": "gateway-client", "version": "1.0.0", "platform": "windows", "mode": "backend"},
-            "role": "operator",
-            "scopes": ["operator.read", "operator.write"],
-            "auth": {"token": self.config.token},
-            "caps": [], "commands": [],
-        })
+        await self._send_async(
+            "connect",
+            {
+                "minProtocol": 3,
+                "maxProtocol": 3,
+                "client": {
+                    "id": "gateway-client",
+                    "version": "1.0.0",
+                    "platform": "windows",
+                    "mode": "backend",
+                },
+                "role": "operator",
+                "scopes": ["operator.read", "operator.write"],
+                "auth": {"token": self.config.token},
+                "caps": [],
+                "commands": [],
+            },
+        )
 
-        # Receive hello-ok
-        raw = await self._ws.recv()
+        raw = await asyncio.wait_for(self._ws.recv(), timeout=float(self.config.ws_timeout))
         hello = json.loads(raw)
         if not hello.get("ok"):
-            raise RuntimeError(f"WebSocket connect failed: {hello.get('error', {}).get('message', 'unknown')}")
-
-        # Verify scopes
+            raise RuntimeError(
+                f"WebSocket connect failed: {hello.get('error', {}).get('message', 'unknown')}"
+            )
         granted = hello.get("payload", {}).get("auth", {}).get("scopes", [])
         if "operator.write" not in granted:
             raise RuntimeError(f"Granted scopes {granted} missing operator.write")
 
-    async def _send_async(self, method: str, params: dict) -> int:
+    async def _send_async(self, method: str, params: dict[str, Any]) -> int:
+        if self._ws is None:
+            raise RuntimeError("WebSocket is not connected")
         self._req_id += 1
-        await self._ws.send(json.dumps({
-            "type": "req", "id": str(self._req_id), "method": method, "params": params,
-        }))
+        await self._ws.send(
+            json.dumps(
+                {
+                    "type": "req",
+                    "id": str(self._req_id),
+                    "method": method,
+                    "params": params,
+                }
+            )
+        )
         return self._req_id
 
-    async def _recv_response_async(self, expected_id: int, timeout: float = 10.0) -> dict | None:
-        """Wait for a response with the matching id, with a timeout."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+    async def _recv_response_async(self, expected_id: int, timeout: float) -> dict[str, Any] | None:
+        if self._ws is None:
+            return None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
             try:
-                raw = await asyncio.wait_for(self._ws.recv(), timeout=1.0)
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if msg.get("type") == "res" and msg.get("id") == str(expected_id):
-                    return msg
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=min(0.5, remaining))
             except asyncio.TimeoutError:
                 continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("type") == "res" and msg.get("id") == str(expected_id):
+                return msg
+            if msg.get("type") == "event":
+                self._pending_events.append(msg)
         return None
 
     def chat_send_streaming(
@@ -123,24 +184,30 @@ class GatewayWebSocket:
     ) -> str:
         if not self._connected or self._ws is None:
             self.connect()
-        return self._loop.run_until_complete(
-            self._chat_send_streaming_async(text, on_sentence)
-        )
+        assert self._loop is not None
+        return self._loop.run_until_complete(self._chat_send_streaming_async(text, on_sentence))
 
     async def _chat_send_streaming_async(
         self,
         text: str,
         on_sentence: Callable[[str], None] | None = None,
     ) -> str:
-        tagged_text = f"\U0001f3a4 {text}"
-        req_id = await self._send_async("chat.send", {
-            "sessionKey": self.config.session_key,
-            "message": tagged_text,
-            "idempotencyKey": str(uuid.uuid4()),
-        })
+        if self._ws is None:
+            raise RuntimeError("WebSocket is not connected")
 
-        # Wait for ack with timeout (10s)
-        response = await self._recv_response_async(req_id, timeout=10.0)
+        tagged_text = f"\U0001f3a4 {text}"
+        # Record before chat.send so a slow ACK cannot move the session matching window forward.
+        send_timestamp = time.time()
+        req_id = await self._send_async(
+            "chat.send",
+            {
+                "sessionKey": self.config.session_key,
+                "message": tagged_text,
+                "idempotencyKey": str(uuid.uuid4()),
+            },
+        )
+
+        response = await self._recv_response_async(req_id, timeout=float(self.config.ws_timeout))
         if response is None:
             self._get_logger().warning("chat.send ack timeout")
             return ""
@@ -148,198 +215,209 @@ class GatewayWebSocket:
             return ""
 
         run_id = response.get("payload", {}).get("runId", "")
-        _log = self._get_logger()
-        _log.info("Chat sent, runId=%s", run_id)
+        log = self._get_logger()
+        log.info("Chat sent, runId=%s", run_id)
+        accumulator = ResponseAccumulator()
+        stable_polls = 0
+        deadline = time.monotonic() + float(self.config.timeout_seconds)
+        session_dir = self._session_dir()
 
-        # Record the timestamp when we sent the message, to match against session file
-        send_timestamp = time.time()
-        _log.debug("send_timestamp=%.1f (for matching against session file)", send_timestamp)
+        while time.monotonic() < deadline:
+            changed = False
 
-        full_text = ""
-        pending_buffer = ""
-        stable_count = 0  # count how many polls with no change
-        tagged = "\U0001f3a4"
-        agent_id = self.config.agent_id
-        session_dirs = [
-            Path(r"E:\AppData\.openclaw\agents") / agent_id / "sessions",
-            Path(os.path.expanduser("~")) / ".openclaw" / "agents" / agent_id / "sessions",
-        ]
-        deadline = time.time() + 120  # 2 min timeout
+            events = self._pending_events
+            self._pending_events = []
+            event = await self._recv_event_nonblocking(timeout=0.2)
+            if event is not None:
+                events.append(event)
 
-        while time.time() < deadline:
-            # Drain any WebSocket events (non-blocking) for potential future streaming
-            try:
-                raw = await asyncio.wait_for(self._ws.recv(), timeout=0.2)
-                evt = json.loads(raw)
-                if evt.get("type") == "event" and evt.get("event") == "agent":
-                    p = evt.get("payload", {})
-                    if p.get("runId") == run_id:
-                        d = p.get("data", {})
-                        if d.get("output"):
-                            new_output = d["output"]
-                            if len(new_output) > len(full_text):
-                                new_chunk = new_output[len(full_text):]
-                                full_text = new_output
-                                pending_buffer += new_chunk
-                                stable_count = 0
-                                # Deliver complete sentences in background thread
-                                if on_sentence:
-                                    sentences, pending_buffer = _extract_complete_sentences(pending_buffer)
-                                    for sentence in sentences:
-                                        if sentence:
-                                            _log.debug("Stream sentence: [%s]", sentence[:60])
-                                            threading.Thread(
-                                                target=on_sentence,
-                                                args=(sentence,),
-                                                daemon=True,
-                                            ).start()
-                        if d.get("output") and d.get("finish_reason"):
-                            pass  # Stream is complete for this event type
-            except asyncio.TimeoutError:
-                pass
-
-            # Primary: poll session file for the complete assistant message
-            for sd in session_dirs:
-                if not sd.exists():
+            for evt in events:
+                snapshot = self._agent_snapshot(evt, run_id)
+                if snapshot is None:
                     continue
-                try:
-                    # Exclude .trajectory.jsonl files - they are trace logs, not session files
-                    files = sorted(
-                        [f for f in sd.glob("*.jsonl") if not f.name.endswith(".trajectory.jsonl")],
-                        key=os.path.getmtime, reverse=True
-                    )
-                    if not files:
-                        continue
-                    with open(str(files[0]), "r", encoding="utf-8") as f:
-                        lines = f.read().splitlines()
-                    # Find the user message that matches our request (by timestamp)
-                    # We look for a user message with:
-                    # 1. 🎤 tag (sent by voice-control)
-                    # 2. timestamp >= send_timestamp (our current request)
-                    found_idx = -1
-                    for i in range(len(lines) - 1, -1, -1):
-                        if not lines[i].strip():
-                            continue
-                        try:
-                            e = json.loads(lines[i])
-                            if e.get("message", {}).get("role") == "user":
-                                # Check timestamp first
-                                msg_ts = e.get("timestamp", "")
-                                if msg_ts:
-                                    # Parse ISO timestamp and compare
-                                    try:
-                                        from datetime import datetime, timezone
-                                        # Handle both with and without timezone
-                                        if msg_ts.endswith("Z"):
-                                            msg_dt = datetime.fromisoformat(msg_ts.replace("Z", "+00:00"))
-                                        else:
-                                            # If no timezone, assume UTC (session file uses UTC)
-                                            msg_dt = datetime.fromisoformat(msg_ts).replace(tzinfo=timezone.utc)
-                                        msg_unix = msg_dt.timestamp()
-                                        if msg_unix < send_timestamp - 1:  # 1s tolerance
-                                            continue  # This is an old message, skip
-                                    except Exception:
-                                        pass
-                                # Check for 🎤 tag
-                                c = e["message"].get("content", "")
-                                txt = ""
-                                if isinstance(c, str):
-                                    txt = c
-                                elif isinstance(c, list):
-                                    for p in c:
-                                        if p.get("type") == "text":
-                                            txt = p.get("text", "")
-                                            break
-                                if tagged in txt:
-                                    _log.debug("Found matching user message at line %d, ts=%s, msg_unix=%.1f, send_ts=%.1f",
-                                               i, msg_ts, msg_unix, send_timestamp)
-                                    found_idx = i
-                                    break
-                        except Exception:
-                            continue
-                    if found_idx >= 0:
-                        for j in range(found_idx + 1, len(lines)):
-                            try:
-                                a = json.loads(lines[j])
-                                if a.get("message", {}).get("role") != "assistant":
-                                    continue
-                                c = a["message"].get("content", "")
-                                if not isinstance(c, list):
-                                    continue
-                                texts = []
-                                for part in c:
-                                    if part.get("type") == "text":
-                                        t = part.get("text", "").strip()
-                                        if t and len(t) > 3:
-                                            texts.append(t)
-                                if texts:
-                                    combined = "".join(texts)
-                                    noise_keywords = ["Command still", "FileNotFound", "(no output)", "Use process", "No module", "未找到文件"]
-                                    is_noise = any(k in combined for k in noise_keywords)
-                                    if not is_noise and len(combined) > len(full_text):
-                                        # New/changed text from session file
-                                        new_chunk = combined[len(full_text):]
-                                        full_text = combined
-                                        pending_buffer += new_chunk
-                                        stable_count = 0
-                                        _log.debug("Session file text (+%d): [%s]", len(new_chunk), new_chunk[:60])
-                                        # Deliver complete sentences
-                                        if on_sentence:
-                                            sentences, pending_buffer = _extract_complete_sentences(pending_buffer)
-                                            for sentence in sentences:
-                                                if sentence:
-                                                    _log.debug("Stream sentence: [%s]", sentence[:60])
-                                                    threading.Thread(
-                                                        target=on_sentence,
-                                                        args=(sentence,),
-                                                        daemon=True,
-                                                    ).start()
-                            except Exception:
-                                continue
-                except Exception:
-                    continue
+                before = accumulator.full_text
+                sentences = accumulator.feed_snapshot(snapshot)
+                changed = changed or accumulator.full_text != before
+                self._deliver_sentences(sentences, on_sentence)
 
-            # If text is stable for 3 polls (1.5s) and has content, we're done
-            if full_text:
-                stable_count += 1
-                if stable_count >= 3:
-                    _log.info("Response stable for 3 polls, final text: [%s]", full_text[:80])
-                    # Speak any remaining fragment
-                    if on_sentence and pending_buffer.strip():
-                        remainder = pending_buffer.strip()
-                        _log.debug("Final fragment: [%s]", remainder[:60])
-                        threading.Thread(
-                            target=on_sentence,
-                            args=(remainder,),
-                            daemon=True,
-                        ).start()
-                    return full_text
+            session_snapshot = self._read_session_snapshot(
+                session_dir,
+                send_timestamp=send_timestamp,
+                tagged="\U0001f3a4",
+            )
+            if session_snapshot:
+                before = accumulator.full_text
+                sentences = accumulator.feed_snapshot(session_snapshot)
+                changed = changed or accumulator.full_text != before
+                self._deliver_sentences(sentences, on_sentence)
+
+            if accumulator.full_text:
+                stable_polls = 0 if changed else stable_polls + 1
+                if stable_polls >= 3:
+                    remainder = accumulator.flush()
+                    if remainder and on_sentence is not None:
+                        on_sentence(remainder)
+                    return accumulator.full_text
 
             await asyncio.sleep(0.2)
 
-        # Timeout: return whatever we have
-        _log.warning("Response deadline reached")
-        if on_sentence and pending_buffer.strip():
-            threading.Thread(
-                target=on_sentence,
-                args=(pending_buffer.strip(),),
-                daemon=True,
-            ).start()
-        return full_text
+        log.warning("Response deadline reached")
+        remainder = accumulator.flush()
+        if remainder and on_sentence is not None:
+            on_sentence(remainder)
+        return accumulator.full_text
 
-    def _get_logger(self):
+    async def _recv_event_nonblocking(self, timeout: float) -> dict[str, Any] | None:
+        if self._ws is None:
+            return None
+        try:
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if msg.get("type") == "event":
+            return msg
+        return None
+
+    @staticmethod
+    def _agent_snapshot(event: dict[str, Any], run_id: str) -> str | None:
+        if event.get("type") != "event" or event.get("event") != "agent":
+            return None
+        payload = event.get("payload", {})
+        if payload.get("runId") != run_id:
+            return None
+        data = payload.get("data", {})
+        output = data.get("output")
+        return output if isinstance(output, str) and output else None
+
+    @staticmethod
+    def _deliver_sentences(
+        sentences: list[str],
+        on_sentence: Callable[[str], None] | None,
+    ) -> None:
+        if on_sentence is None:
+            return
+        for sentence in sentences:
+            on_sentence(sentence)
+
+    def _session_dir(self) -> Path:
+        configured_home = getattr(self.config, "home_dir", None)
+        env_home = os.getenv("OPENCLAW_HOME")
+        home = Path(configured_home or env_home or (Path.home() / ".openclaw")).expanduser()
+        return home / "agents" / self.config.agent_id / "sessions"
+
+    def _read_session_snapshot(
+        self,
+        session_dir: Path,
+        *,
+        send_timestamp: float,
+        tagged: str,
+    ) -> str | None:
+        if not session_dir.exists():
+            return None
+        try:
+            files = sorted(
+                [
+                    path
+                    for path in session_dir.glob("*.jsonl")
+                    if not path.name.endswith(".trajectory.jsonl")
+                ],
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return None
+        if not files:
+            return None
+
+        try:
+            lines = files[0].read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+
+        found_idx = -1
+        for index in range(len(lines) - 1, -1, -1):
+            try:
+                entry = json.loads(lines[index])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            message = entry.get("message", {})
+            if message.get("role") != "user":
+                continue
+            if not self._timestamp_is_current(entry.get("timestamp"), send_timestamp):
+                continue
+            if tagged in self._message_text(message.get("content", "")):
+                found_idx = index
+                break
+
+        if found_idx < 0:
+            return None
+
+        latest: str | None = None
+        for line in lines[found_idx + 1 :]:
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            message = entry.get("message", {})
+            if message.get("role") != "assistant":
+                continue
+            text = self._message_text(message.get("content", ""), minimum_length=4)
+            if text and not any(keyword in text for keyword in _NOISE_KEYWORDS):
+                latest = text
+        return latest
+
+    @staticmethod
+    def _timestamp_is_current(value: Any, send_timestamp: float) -> bool:
+        if not isinstance(value, str) or not value:
+            return True
+        try:
+            if value.endswith("Z"):
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            else:
+                parsed = datetime.fromisoformat(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp() >= send_timestamp - 1.0
+        except ValueError:
+            return True
+
+    @staticmethod
+    def _message_text(content: Any, minimum_length: int = 0) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if not isinstance(content, list):
+            return ""
+        parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "text":
+                continue
+            text = str(part.get("text", "")).strip()
+            if text and len(text) >= minimum_length:
+                parts.append(text)
+        return "".join(parts)
+
+    @staticmethod
+    def _get_logger():
         import logging
+
         return logging.getLogger("openclaw.voice_control")
 
     def close(self) -> None:
-        if self._ws is not None:
+        ws = self._ws
+        loop = self._loop
+        self._ws = None
+        self._connected = False
+        self._pending_events.clear()
+
+        if ws is not None and loop is not None and not loop.is_closed():
             try:
-                if self._loop and self._loop.is_running():
-                    self._loop.run_until_complete(self._ws.close())
+                loop.run_until_complete(ws.close())
             except Exception:
                 pass
-            self._ws = None
-            self._connected = False
-        if self._loop:
-            self._loop.close()
-            self._loop = None
+        if loop is not None and not loop.is_closed():
+            loop.close()
+        self._loop = None
