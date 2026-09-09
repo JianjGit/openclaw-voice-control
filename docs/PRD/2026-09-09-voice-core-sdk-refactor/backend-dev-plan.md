@@ -5,7 +5,7 @@
 - [x] BE-01 事件模型与 Presenter 协议 — `BE-T01` 通过，提交 `1dd11b8`。
 - [x] BE-02 RuntimeControl 与停止机制解耦 — `BE-T02` 通过，提交 `4d54bc1`。
 - [x] BE-03 SpeechController 与 Windows TTS 重构 — `BE-T03` fake backend 语义测试通过，提交 `6cfef1f`；Windows SAPI 真机验证留待 BE-12。
-- [ ] BE-04 统一 ASR 与 STT HTTP 调用链
+- [x] BE-04 统一 ASR 与 STT HTTP 调用链 — `BE-T04` 并发锁与 HTTP 契约测试通过，提交 `78d4bdd`。
 - [ ] BE-05 统一 OpenClaw 文本对话入口
 - [ ] BE-06 外部主动朗读 API
 - [ ] BE-07 VoiceControlService 主循环迁移
