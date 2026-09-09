@@ -23,7 +23,7 @@ EMOJI_PATTERN = re.compile(
 )
 
 
-def clean_text_for_overlay(text: str) -> str:
+def clean_text(text: str) -> str:
     if not text:
         return ""
 
@@ -51,7 +51,7 @@ def clean_text_for_overlay(text: str) -> str:
 
 
 def clean_text_for_tts(text: str) -> str:
-    value = clean_text_for_overlay(text)
+    value = clean_text(text)
     if not value:
         return ""
 
