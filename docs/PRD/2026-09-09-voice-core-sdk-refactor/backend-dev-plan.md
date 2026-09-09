@@ -9,7 +9,7 @@
 - [x] BE-05 统一 OpenClaw 文本对话入口 — `BE-T05` 事件顺序、speak=false、错误与 turn lock 测试通过，提交 `c06f740`。
 - [x] BE-06 外部主动朗读 API — `BE-T06` FIFO、单条 wait、stop 与 metadata 测试通过，提交 `4d070b4`。
 - [x] BE-07 VoiceControlService 主循环迁移 — `BE-T07` 单轮编排、录音交接、Presenter 事件与 wakeword pause/resume 测试通过，提交 `e764bae`。
-- [ ] BE-08 Gateway WebSocket 与流式回复稳定化
+- [x] BE-08 Gateway WebSocket 与流式回复稳定化 — `BE-T08` WS/session 去重、ACK 早到事件、配置超时与 close 生命周期测试通过，提交 `b366b67`。
 - [ ] BE-09 配置、依赖与公开导入面整理
 - [ ] BE-10 删除 Overlay 与旧平台残留
 - [ ] BE-11 自动化测试与 Windows CI
@@ -112,7 +112,7 @@
 - 建立单一流式文本聚合/去重逻辑，保证一句只 enqueue 一次且顺序稳定。
 - 不为每个句子创建新的回调线程；由有序回调或单一队列向 SpeechController 交付。
 - 将 ACK、总响应等硬编码超时改为配置驱动。
-- 避免全局删除进程中的所有 proxy 环境变量，仅对 websocket 连接本身禁用代理，或在局部上下文处理。
+- 避免全局删除进程中的所有 proxy 环境变量，仅对目标连接做必要的代理禁用或显式连接配置。
 - 修复 WebSocket `close()` 生命周期，确保同步 wrapper 使用的 event loop 能真正关闭连接。
 - 将 OpenClaw session 根目录从硬编码盘符抽为可配置路径，并保留合理默认值。
 
