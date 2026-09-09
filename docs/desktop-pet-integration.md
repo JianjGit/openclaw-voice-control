@@ -11,7 +11,7 @@
           │
           ▼
 OpenClaw Voice Core
-  ├─ Wakeword
+  ├─ Wakeword / listen_once
   ├─ Recording
   ├─ FunASR / SenseVoice
   ├─ OpenClaw Gateway
@@ -24,6 +24,7 @@ OpenClaw Voice Core
 Voice Core 负责：
 
 - 唤醒词检测；
+- `listen_once()` 一次性按键/点击说话入口；
 - 麦克风录音与静音结束判断；
 - SenseVoice / FunASR 识别；
 - OpenClaw Gateway 文本对话；
@@ -46,7 +47,7 @@ Voice Core 负责：
 
 ## 2. 推荐线程模型
 
-`VoiceControlService.run()` 是阻塞式独立主循环，所以不要在 GUI 主线程直接运行。
+`VoiceControlService.run()` 是阻塞式独立主循环，`listen_once()` 也会阻塞直到这一轮录音/识别/对话结束，所以都不要在 GUI 主线程直接运行。
 
 推荐：
 
@@ -56,7 +57,7 @@ GUI 主线程
   ├─ UI / 动画 / 气泡
   ├─ 定时读取事件队列，或通过 GUI framework signal 转发
   │
-  └──── API 调用任务 ───► 后台线程
+  └──── API 调用任务 ───► 后台线程 / 线程池
                          │
                          ▼
                   VoiceControlService
@@ -64,7 +65,7 @@ GUI 主线程
                          └──── VoiceEvent ───► Presenter ───► thread-safe queue
 ```
 
-`Presenter.emit()` 可能由 Voice Core 服务线程或 Speech worker 调用，所以 GUI 必须把事件 marshal 回自己的 UI 主线程。
+`Presenter.emit()` 可能由 Voice Core 服务线程、`listen_once()` worker 或 Speech worker 调用，所以 GUI 必须把事件 marshal 回自己的 UI 主线程。
 
 ## 3. 最小 Presenter
 
@@ -109,6 +110,10 @@ config = load_config("config/default.yaml", ".env")
 service = VoiceControlService(config, presenter=presenter)
 ```
 
+Voice Core 有两种麦克风输入模式。
+
+### 4.1 常驻唤醒模式：run()
+
 如果桌宠需要完整语音唤醒模式，把 `service.run()` 放到后台线程：
 
 ```python
@@ -133,6 +138,70 @@ wakeword
   -> streaming TTS
   -> idle
 ```
+
+### 4.2 按钮/热键触发：listen_once()
+
+如果桌宠不需要常驻唤醒词，而是希望用户点击麦克风按钮、按住快捷键或选择菜单后立即说话，直接在后台 worker 中调用：
+
+```python
+ok = service.listen_once(
+    speak=True,
+    metadata={
+        "source": "desktop_pet",
+        "request_id": "voice-001",
+    },
+)
+```
+
+调用后**不会等待 wakeword**，而是立即进入：
+
+```text
+listen_once()
+  -> listening
+  -> recording
+  -> ASR
+  -> recognized
+  -> thinking
+  -> OpenClaw Gateway
+  -> speaking (0..N)
+  -> reply
+  -> idle
+```
+
+参数：
+
+- `speak=True`：OpenClaw 回复会进入 TTS；
+- `speak=False`：完成录音、ASR 和 OpenClaw 对话，但不朗读回复；
+- `metadata`：会沿着 listening / recognized / thinking / reply / speaking / idle 等事件向外传递，默认 `source="listen_once"`，调用方可以覆盖为 `desktop_pet` 等来源。
+
+返回：
+
+- `True`：本轮成功完成；
+- `False`：没有录到有效语音，或后续 recorded turn 未成功完成。
+
+如果打开麦克风本身抛异常，`listen_once()` 会先发 `error(stage="recording") -> idle`，再把异常抛给调用方。
+
+### 4.3 两种模式不要并发
+
+`run()` 和 `listen_once()` 都会占用语音输入，因此它们是**替代模式**，不是两个同时开启的入口。
+
+例如桌宠采用按钮说话模式时：
+
+```text
+创建 VoiceControlService
+  -> 不调用 run()
+  -> 用户点击麦克风按钮
+  -> worker 调用 listen_once()
+  -> 完成后等待下一次按钮触发
+```
+
+如果已经有一个 `run()` / `listen_once()` 占用输入，再触发另一个输入操作，会抛：
+
+```python
+RuntimeError("voice input is already active")
+```
+
+这样可以避免两个 `sounddevice.InputStream` 同时抢麦克风。
 
 ## 5. VoiceEvent 怎么映射到桌宠
 
@@ -310,9 +379,11 @@ Voice Core Presenter
   -> QWidget / QML / 桌宠状态机
 ```
 
-这样 Qt 生命周期、窗口线程和 Voice Core worker 不会互相污染。
+按钮说话时，Qt click handler 不应直接调用阻塞的 `listen_once()`，而应把它提交给 `QThreadPool`、Python worker thread 或其它后台任务，然后继续通过 Presenter 事件刷新 UI。
 
 ## 11. 生命周期建议
+
+### 常驻唤醒模式
 
 启动：
 
@@ -330,6 +401,23 @@ service.close()
 voice_thread.join(timeout=5)
 ```
 
+### 按键说话模式
+
+启动时只创建 `VoiceControlService`，不要启动 `run()`：
+
+```text
+创建 Presenter
+  -> load_config
+  -> VoiceControlService
+  -> 用户触发时 worker 调用 listen_once()
+```
+
+关闭时直接：
+
+```python
+service.close()
+```
+
 `close()` 是幂等的，可以安全重复调用。
 
 建议桌宠在以下场景统一调用 `close()`：
@@ -345,7 +433,7 @@ Voice Core 不规定 UI 状态机，但一般可以这样映射：
 
 ```text
 idle
- ├─ listening
+ ├─ listening        # wakeword 后录音，或 listen_once() 直接进入
  │    └─ recognized
  │         └─ thinking
  │              ├─ speaking
@@ -362,11 +450,12 @@ idle
 ## 13. 常用 API 速查
 
 ```python
+service.listen_once(speak=True, metadata=None)         # -> bool, 不经过 wakeword
 service.transcribe_file(path, metadata=None)          # -> str
 service.ask_text(text, speak=True, metadata=None)     # -> str
 service.speak_message(text, metadata=None, wait=False)
 service.stop_speaking()
-service.run()                                         # blocking
+service.run()                                         # blocking wakeword mode
 service.close()                                       # idempotent
 ```
 
@@ -387,10 +476,10 @@ from openclaw_voice_control import (
 
 - 整体架构：[`architecture.md`](architecture.md)
 - 事件协议：[`modules/events-and-text.md`](modules/events-and-text.md)
-- Standalone 主循环：[`modules/main-loop.md`](modules/main-loop.md)
+- Standalone / push-to-talk 输入模式：[`modules/main-loop.md`](modules/main-loop.md)
 - Gateway：[`modules/gateway-ws.md`](modules/gateway-ws.md)
 - ASR：[`modules/asr.md`](modules/asr.md)
 - TTS：[`modules/tts.md`](modules/tts.md)
 - Wakeword：[`modules/wakeword.md`](modules/wakeword.md)
 - 配置：[`modules/cli-and-config.md`](modules/cli-and-config.md)
-- 完整 API 设计：[`PRD/2026-09-09-voice-core-sdk-refactor/api-design.md`](PRD/2026-09-09-voice-core-sdk-refactor/api-design.md)
+- 原始重构 API 设计：[`PRD/2026-09-09-voice-core-sdk-refactor/api-design.md`](PRD/2026-09-09-voice-core-sdk-refactor/api-design.md)
