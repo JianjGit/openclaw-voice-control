@@ -1,5 +1,20 @@
 # Voice Core SDK 后端开发计划
 
+## 0. 实施状态
+
+- [x] BE-01 事件模型与 Presenter 协议 — `BE-T01` 通过，提交 `1dd11b8`。
+- [ ] BE-02 RuntimeControl 与停止机制解耦
+- [ ] BE-03 SpeechController 与 Windows TTS 重构
+- [ ] BE-04 统一 ASR 与 STT HTTP 调用链
+- [ ] BE-05 统一 OpenClaw 文本对话入口
+- [ ] BE-06 外部主动朗读 API
+- [ ] BE-07 VoiceControlService 主循环迁移
+- [ ] BE-08 Gateway WebSocket 与流式回复稳定化
+- [ ] BE-09 配置、依赖与公开导入面整理
+- [ ] BE-10 删除 Overlay 与旧平台残留
+- [ ] BE-11 自动化测试与 Windows CI
+- [ ] BE-12 文档校准与外部消费方集成验证
+
 ## 1. 实施原则
 
 - 以 `functional-design.md`、`backend-design.md` 和 `api-design.md` 为本轮实现基线，不在开发过程中引入文档范围外的桌宠 UI 逻辑。
