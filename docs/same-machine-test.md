@@ -1,104 +1,90 @@
-# Same-Machine Isolation Test
+# Same-Machine Integration Test
 
-This document describes how to validate the public repository on the same Mac while
-still treating the repository as a self-contained environment.
+Use this procedure to validate the Windows Voice Core on a real development machine after the hardware-free test suite passes.
 
 ## Goal
 
-Verify that the public repository can run from its own files, paths, scripts, and launch agents.
+Prove that the checked-out repository works with the machine's actual microphone, wakeword backend, local ASR models, Windows SAPI voice, OpenClaw Gateway, and local STT HTTP endpoint without relying on any removed Overlay/macOS runtime.
 
-## Important Limit
+## Preparation
 
-This is a strong validation step, but not a perfect clean-room install.
+1. Stop other processes that may own the microphone or the configured STT port.
+2. Activate the repository `.venv`.
+3. Copy `.env.example` to `.env` and fill real local values.
+4. Confirm the SenseVoice/VAD paths or network model access.
+5. Confirm the OpenClaw Gateway is running and `OPENCLAW_HOME` matches its session root.
 
-Because the test still runs on the same machine, some things outside the
-repository may already exist:
+## Hardware checks
 
-- microphone permissions
-- OpenClaw itself
-- downloaded model files
-- local wakeword assets
-
-There is one more practical limit that matters for voice testing:
-
-- not every execution context on macOS can see real microphone devices
-
-For example, the service can boot, load ASR, initialize the wakeword engine, and enter the idle listening loop from the public repository, while a restricted execution context still cannot see real Core Audio inputs.
-
-That means "service starts" and "service can hear speech" are separate checks.
-
-Fresh-clone validation added one more important lesson:
-
-- background success on macOS must be tested through the real repository deployment
-  path, not only through a foreground terminal run
-- the current recommended background path is the host-app launcher built by
-  `./scripts/deploy_macos.sh`
-
-## Recommended Procedure
-
-1. Stop any other voice service that may still be using the microphone.
-2. Confirm any previous LaunchAgents are no longer active.
-3. Open a normal macOS Terminal session as your logged-in user.
-4. Work only inside the public repository directory.
-5. Create a fresh `.env` from `.env.example`.
-6. Run `./scripts/doctor.sh`.
-7. Run `./scripts/list_audio_devices.py` or `./.venv/bin/python scripts/list_audio_devices.py` and confirm real input devices are visible.
-8. Run the public service directly.
-9. Run the public overlay directly if needed.
-10. If direct runs work, test `./scripts/deploy_macos.sh`.
-11. After validation, test `./scripts/uninstall_macos.sh`.
-
-## What Counts As Success
-
-- the service starts from the public repository
-- the terminal session can see a real input device instead of only `NULL Capture Device`
-- the overlay reads the public repository runtime state file
-- no script depends on an unrelated local project directory
-- launchd labels come from the public repository templates
-- the service reacts to an actual wakeword spoken in that local session
-
-## Manual Checks
-
-Check the running command paths:
-
-```bash
-ps aux | grep openclaw_voice_control | grep -v grep
-ps aux | grep openclaw_voice_control.overlay_app | grep -v grep
+```powershell
+python scripts/list_audio_devices.py
+python scripts/test_microphone.py
 ```
 
-Check the launch agents:
+Select a valid `audio.input_device_index` in `config/default.yaml` or a local config override when necessary.
 
-```bash
-launchctl print "gui/$(id -u)/ai.openclaw.voice-control" | sed -n '1,40p'
-launchctl print "gui/$(id -u)/ai.openclaw.overlay" | sed -n '1,40p'
+## Standalone service
+
+```powershell
+.\run_service.bat
 ```
 
-Check the runtime files:
+Wait until logs show ASR ready, wakeword ready, and the idle listening loop. Then speak the configured wakeword and complete one real interaction.
 
-```bash
-ls -la runtime/
-tail -f logs/voice_control.log
+Success requires:
+
+- wakeword is detected;
+- wake acknowledgement plays;
+- recording starts and ends on silence;
+- ASR produces the intended text;
+- OpenClaw receives the turn;
+- the final reply is returned;
+- streamed speech is ordered and not duplicated;
+- the service returns to idle and can accept another independent wake.
+
+## STT HTTP
+
+With the service running:
+
+```powershell
+python scripts/stt_endpoint_client.py --input_path C:\audio\sample.wav
 ```
 
-Check that audio devices are really visible:
+If using a non-default endpoint, set `STT_HOST` / `STT_PORT` or pass `--host` / `--port`.
 
-```bash
-./.venv/bin/python scripts/list_audio_devices.py
-./.venv/bin/python scripts/test_microphone.py --device -1 --seconds 3
+## External API checks
+
+From another Python harness, construct the core with a Presenter and verify:
+
+```python
+service.transcribe_file(...)
+service.ask_text("hello", speak=False)
+service.speak_message("hello", wait=True)
+service.stop_speaking()
+service.close()
 ```
 
-## If The Test Fails
+`examples/external_presenter.py` demonstrates the event bridge used by an external application.
 
-The most common causes are:
+## Shutdown checks
 
-- missing `.env`
-- missing dependency installation
-- wakeword asset path not available yet
-- `.ppn` placeholder mistaken for a real bundled repository asset
-- VAD model not actually prepared under `models/fsmn-vad`
-- FunASR or Porcupine packages not installed
-- editable install blocked by PyPI SSL verification issues
-- another voice service is still running and masking the issue
-- the current terminal or execution context cannot see microphone devices even though macOS itself has them
-- the user is still testing the older bare-Python background path instead of the
-  current host-app deployment path
+After `close()` or Ctrl+C:
+
+- the STT port is released;
+- the microphone is released;
+- no SAPI worker remains active;
+- the wakeword stream is closed;
+- Gateway websocket resources are closed.
+
+## Failure isolation
+
+Treat these as separate layers:
+
+1. package/import/test failure;
+2. microphone visibility/capture failure;
+3. wakeword detection failure;
+4. ASR model/recognition failure;
+5. Gateway/session fallback failure;
+6. SAPI voice/output failure.
+
+A process reaching the idle loop does not by itself prove the complete audio/Gateway path.
