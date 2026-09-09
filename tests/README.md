@@ -8,7 +8,8 @@ Coverage includes:
 - RuntimeControl stop/shutdown semantics;
 - SpeechController FIFO, stop, wait, backend lifecycle, and worker failures;
 - serialized ASR access and STT HTTP contract;
-- `listen_once()` push-to-talk orchestration, input-mode exclusivity, metadata/speak forwarding, and recording-error cleanup;
+- `listen_once()` push-to-talk orchestration, metadata/speak forwarding, and recording-error cleanup;
+- runtime `wakeword` / `push_to_talk` switching, wakeword pause/resume reuse, deferred switching, cancellation, and shared microphone-lock safety;
 - `ask_text()` and `speak_message()` public behavior;
 - recorded-turn orchestration and wakeword/recording handoff;
 - Gateway WS/session aggregation and deduplication;
