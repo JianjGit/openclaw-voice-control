@@ -13,7 +13,21 @@ External applications integrate through:
 - `Presenter.emit(event)`
 - `NullPresenter` / `ConsolePresenter`
 
-`VoiceControlService` exposes both a standalone wakeword mode (`run()`) and an explicit one-shot microphone mode (`listen_once()`).
+Important public service APIs now include:
+
+```python
+service.set_input_mode("wakeword")
+service.set_input_mode("push_to_talk")
+service.get_input_mode()
+service.get_pending_input_mode()
+service.listen_once()
+service.transcribe_file(...)
+service.ask_text(...)
+service.speak_message(...)
+service.stop_speaking()
+service.run()
+service.close()
+```
 
 `Presenter.emit()` may run on the service thread, a `listen_once()` worker, or the speech worker. UI consumers must marshal events to their own UI thread.
 
@@ -32,60 +46,205 @@ wakeword.py        openWakeWord / optional Porcupine engines
 gateway_ws.py      OpenClaw Gateway websocket + session fallback aggregation
 openclaw_client.py thin Gateway wrapper
 text.py            shared markdown/emoji normalization
-service.py         public API, push-to-talk and standalone wakeword orchestration
+service.py         public API, input-mode state and voice orchestration
 cli.py             command-line entrypoint
 ```
 
-## Standalone flow
+## Persistent service lifecycle
+
+`run()` is the persistent Voice Core lifecycle:
 
 ```text
 run()
-  -> load ASR
-  -> start STT HTTP
-  -> start wakeword engine
+  -> load ASR once
+  -> start STT HTTP once
+  -> initialize current input mode
   -> idle
-  -> wakeword detected
-  -> wake acknowledgement through SpeechController
-  -> pause wakeword audio stream
-  -> record until silence
-  -> transcribe_file()
-  -> recognized event
-  -> ask_text(..., speak=True)
-  -> thinking
-  -> Gateway streaming
-  -> speaking events / queued SAPI playback
-  -> reply
-  -> idle
-  -> resume wakeword stream
+  -> keep service alive until shutdown
 ```
 
-The default standalone behavior is one turn per wake. A follow-up conversation loop is not part of the current implementation.
+Changing input mode does not rebuild the service.
 
-## Embedded flows
+The same objects remain alive:
 
-### Push-to-talk / one-shot listening
+- FunASR / SenseVoice
+- OpenClaw Gateway client
+- SpeechController / Windows TTS
+- STT HTTP server
+- VoiceControlService
+
+Only wakeword microphone listening is paused/resumed.
+
+## Runtime input modes
 
 ```text
-external caller -> listen_once()
-                -> record until silence
-                -> transcribe_file()
-                -> recognized
-                -> ask_text()
-                -> Gateway / optional TTS
-                -> reply -> idle
+                         set_input_mode()
+                  +----------------------------+
+                  |                            |
+                  v                            v
+          +---------------+            +----------------+
+          |   wakeword    |            | push_to_talk   |
+          | engine active |            | engine paused  |
+          +-------+-------+            +--------+-------+
+                  |                             |
+          wake detected                 listen_once()
+                  |                             |
+                  +-------------+---------------+
+                                v
+                    shared recorded-turn path
 ```
 
-`listen_once()` does not start or wait for wakeword detection. It returns `True` when the recorded turn completes successfully and `False` when no valid speech is recorded or the recorded turn fails. `speak=False` keeps the recording + ASR + OpenClaw path but skips TTS.
+### `wakeword`
 
-The default metadata source is `listen_once`; callers can override it for their integration, for example `source="desktop_pet"`.
+The wakeword engine owns the idle microphone path and reads frames until a keyword is detected.
+
+### `push_to_talk`
+
+The wakeword engine is paused, while `run()` continues waiting inside the same process. An external bridge can then invoke `listen_once()` whenever the user presses a microphone button/hotkey.
+
+Full switching semantics: [`input-modes.md`](input-modes.md).
+
+## Wakeword turn
+
+```text
+wakeword read
+  -> keyword detected
+  -> mark turn active
+  -> wakeword.pause()
+  -> wake acknowledgement
+  -> recording
+  -> transcribe_file()
+  -> recognized
+  -> ask_text(..., speak=True)
+  -> Gateway streaming
+  -> SpeechController / SAPI
+  -> reply
+  -> idle
+  -> apply pending input mode, if any
+  -> otherwise wakeword.resume()
+```
+
+The wakeword stream remains paused for the whole recorded conversation, including ASR, Gateway and TTS. This avoids reopening the wakeword microphone while the current answer is still running.
+
+The default standalone behavior remains one conversation turn per wake. There is no automatic follow-up loop.
+
+## Push-to-talk turn
+
+```text
+external bridge
+  -> listen_once()
+  -> acquire shared microphone lock
+  -> recording
+  -> transcribe_file()
+  -> recognized
+  -> ask_text()
+  -> Gateway / optional TTS
+  -> reply
+  -> idle
+  -> release microphone lock
+  -> apply pending input mode, if any
+```
+
+With `run()` active, `listen_once()` is accepted only when the applied mode is `push_to_talk`.
+
+Without `run()`, `listen_once()` remains usable as a standalone one-shot SDK call.
+
+## Deferred mode switching
+
+The service tracks active voice operations across:
+
+- recording turns;
+- ASR calls;
+- Gateway conversation turns;
+- queued/active speech started through the public service API.
+
+If a mode change arrives while activity is in progress:
+
+```text
+set_input_mode(new_mode)
+  -> pending_input_mode = new_mode
+  -> return False
+  -> current activity completes normally
+  -> active count reaches zero
+  -> apply pending mode
+```
+
+The current turn is not interrupted just to change microphone trigger mode.
+
+When the switch finally applies, the core emits an existing `idle` event with:
+
+```python
+{
+    "source": "input_mode",
+    "input_mode": "wakeword" | "push_to_talk",
+    "mode_change": "applied",
+}
+```
+
+## Concurrency and ownership
+
+- `_asr_lock` serializes SenseVoice access, including STT HTTP and recorded turns.
+- `_turn_lock` serializes OpenClaw text/Gateway turns.
+- `_input_mode_lock` is the single microphone-ownership lock shared by wakeword reads/turns and `listen_once()`.
+- `_input_mode_condition` stores applied/pending input mode and lets `run()` sleep while push-to-talk mode is active.
+- `_wakeword_io_lock` serializes wakeword `read()` / `pause()` / `resume()` / close operations.
+- `SpeechController` owns one FIFO worker and one TTS backend instance.
+- SAPI COM initialization, speech calls, and COM teardown occur on the speech worker thread.
+- `RuntimeControl` uses `threading.Event` for speech-stop and service-shutdown signals.
+- Gateway WS snapshots and session fallback snapshots share one response accumulator to prevent duplicate sentence delivery.
+
+## Microphone safety invariant
+
+The important invariant is:
+
+> wakeword input and `listen_once()` must never have active microphone streams at the same time.
+
+### wakeword -> push_to_talk
+
+```text
+wait for current input ownership
+  -> input lock
+  -> wakeword.pause()
+  -> mark push_to_talk applied
+  -> release input lock
+```
+
+### push_to_talk -> wakeword
+
+```text
+wait for listen_once() to release input lock
+  -> wakeword.resume()
+  -> mark wakeword applied
+```
+
+The mode is not reported as applied before the microphone handoff is safe.
+
+## Wakeword lifetime
+
+Wakeword engines expose:
+
+```text
+start
+pause
+resume
+read
+close
+```
+
+`pause()` closes only the recorder/audio stream; it does not destroy the loaded model/engine.
+
+- openWakeWord keeps its loaded model while the `sounddevice.InputStream` is closed.
+- Porcupine keeps the Porcupine engine while the recorder is released.
+- `resume()` reopens input without rebuilding the whole Voice Core.
+- `close()` is reserved for final service teardown.
+
+## Other embedded flows
 
 ### Pure STT
 
 ```text
 external caller -> transcribe_file(path) -> serialized ASR -> text
 ```
-
-No wakeword, Gateway, or TTS is required.
 
 ### Text conversation
 
@@ -103,25 +262,7 @@ external caller -> speak_message(text)
                 -> SpeechController -> speaking -> idle
 ```
 
-This path does not depend on OpenClaw, ASR, wakeword, or recording.
-
-## Concurrency and ownership
-
-- `VoiceControlService._asr_lock` serializes all SenseVoice access, including STT HTTP and recorded turns.
-- `VoiceControlService._turn_lock` serializes text/Gateway conversation turns.
-- `VoiceControlService._input_mode_lock` prevents `run()` and `listen_once()` from opening competing microphone-input modes and rejects concurrent `listen_once()` calls.
-- `SpeechController` owns one FIFO worker and one TTS backend instance.
-- SAPI COM initialization, speech calls, and COM teardown all occur on the speech worker thread.
-- `RuntimeControl` uses `threading.Event` for speech-stop and service-shutdown signals.
-- Gateway WS snapshots and session fallback snapshots share one response accumulator to prevent duplicate sentence delivery.
-
-If another microphone-input mode is already active, `run()` / `listen_once()` raises `RuntimeError("voice input is already active")` rather than racing microphone streams.
-
-## Wakeword and recording handoff
-
-Wakeword engines expose `pause()` / `resume()` for per-turn microphone handoff and `close()` only for final teardown. This keeps the loaded wakeword model alive across turns. A prepared recording stream is started once before handoff; `record_until_silence()` does not start it a second time.
-
-`listen_once()` bypasses the wakeword handoff entirely and lets `record_until_silence()` create its own input stream. Both paths then reuse the same recorded-turn processing.
+These activities also participate in deferred mode switching so a mode change is not applied in the middle of ASR/Gateway/TTS work.
 
 ## Gateway response model
 
@@ -129,11 +270,21 @@ Wakeword engines expose `pause()` / `resume()` for per-turn microphone handoff a
 
 ACK timeout and total response timeout are configuration-driven. Websocket proxy disabling is connection-local; process-wide proxy environment variables are not deleted.
 
-## Lifecycle
+## Lifecycle and shutdown
+
+A desktop-pet bridge should normally:
+
+```text
+create VoiceControlService once
+  -> start run() once on a worker thread
+  -> repeatedly set_input_mode(...)
+  -> call listen_once() whenever push-to-talk is selected
+  -> close() only when the host exits
+```
 
 `VoiceControlService.close()` is idempotent and requests shutdown, closes STT HTTP, stops the speech worker, closes wakeword resources, and closes the Gateway client. `run()` always calls it from `finally`.
 
-In push-to-talk mode, consumers normally create `VoiceControlService`, call `listen_once()` from background workers when needed, and call `close()` when the host application exits. They do not start `run()`.
+Mode switching itself never calls `close()` and never restarts the process.
 
 ## Configuration roots
 
@@ -148,7 +299,7 @@ The default target is Windows. Important configurable boundaries include:
 
 ## Explicit non-goals
 
-The current core does not implement:
+The core does not implement:
 
 - Qt/PySide6 UI
 - Overlay state JSON or stop flag files
