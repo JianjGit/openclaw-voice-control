@@ -1,6 +1,6 @@
 # Tests
 
-The test suite is organized by the backend refactor acceptance IDs `BE-T01` through `BE-T12`.
+The test suite is organized around the backend refactor acceptance IDs `BE-T01` through `BE-T12`, with additional regression coverage for public APIs added after the refactor.
 
 Coverage includes:
 
@@ -8,6 +8,7 @@ Coverage includes:
 - RuntimeControl stop/shutdown semantics;
 - SpeechController FIFO, stop, wait, backend lifecycle, and worker failures;
 - serialized ASR access and STT HTTP contract;
+- `listen_once()` push-to-talk orchestration, input-mode exclusivity, metadata/speak forwarding, and recording-error cleanup;
 - `ask_text()` and `speak_message()` public behavior;
 - recorded-turn orchestration and wakeword/recording handoff;
 - Gateway WS/session aggregation and deduplication;
