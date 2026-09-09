@@ -4,11 +4,10 @@ import os
 import queue
 import re
 import threading
-import time
 from dataclasses import dataclass, field
 
-from .config import OverlayConfig, TTSConfig
-from .state import OverlayStateManager
+from .config import TTSConfig
+from .runtime import RuntimeControl
 from .text import clean_text_for_tts
 
 
@@ -18,53 +17,48 @@ _SENTENCE_SPLIT = re.compile(r"([^。！？\n]+[。！？\n])")
 @dataclass(slots=True)
 class WindowsTTS:
     config: TTSConfig
-    overlay: OverlayConfig
+    runtime: RuntimeControl
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
-    _state: OverlayStateManager = field(init=False)
-    _stop_event: threading.Event = field(default_factory=threading.Event, init=False)
     _voice: object | None = field(default=None, init=False)
     _sentence_queue: "queue.Queue[str]" = field(default_factory=queue.Queue, init=False)
     _player_thread: threading.Thread | None = field(default=None, init=False)
     _player_ready: threading.Event = field(default_factory=threading.Event, init=False)
 
     def __post_init__(self) -> None:
-        self._state = OverlayStateManager(self.overlay)
-        self._player_ready.set()  # player thread not running yet, but ready to accept
+        self._player_ready.set()
         self._init_voice()
 
     def _init_voice(self) -> None:
         try:
             import win32com.client
+
             self._voice = win32com.client.Dispatch("SAPI.SpVoice")
-            self._voice.Rate = 1  # Slightly faster
+            self._voice.Rate = 1
             self._voice.Volume = 100
-            # Set voice if available
-            for v in self._voice.GetVoices():
-                if self.config.voice.lower() in v.GetDescription().lower():
-                    self._voice.Voice = v
+            for voice in self._voice.GetVoices():
+                if self.config.voice.lower() in voice.GetDescription().lower():
+                    self._voice.Voice = voice
                     break
         except Exception:
             self._voice = None
 
-    def clear_stop_flag(self) -> None:
-        self._state.clear_stop_flag()
-        self._stop_event.clear()
+    def clear_stop_request(self) -> None:
+        self.runtime.clear_stop_speech()
 
     def request_stop(self) -> None:
-        self._state.request_stop()
-        self._stop_event.set()
+        self.runtime.request_stop_speech()
 
     def is_stop_requested(self) -> bool:
-        return self._state.is_stop_requested() or self._stop_event.is_set()
+        return self.runtime.is_stop_speech_requested()
 
     def stop_current_speech(self) -> None:
+        self.runtime.request_stop_speech()
         if self._voice is not None:
             try:
-                self._voice.Skip("Sentence", 100)  # Skip all pending
-                self._voice.Speak("", 1)  # Clear
+                self._voice.Skip("Sentence", 100)
+                self._voice.Speak("", 1)
             except Exception:
                 pass
-        self._stop_event.set()
 
     def speak(self, text: str, clean_markdown: bool = True) -> bool:
         if not text or self._voice is None:
@@ -75,12 +69,10 @@ class WindowsTTS:
             return True
 
         self.stop_current_speech()
-        self._stop_event.clear()
+        self.clear_stop_request()
 
-        # Split into sentences for progressive playback
         parts = _SENTENCE_SPLIT.findall(speak_text)
-        sentences = [s.strip() for s in parts if s.strip()]
-        # Include any remaining text after the last punctuation
+        sentences = [sentence.strip() for sentence in parts if sentence.strip()]
         consumed = len("".join(parts))
         remainder = speak_text[consumed:].strip()
         if remainder:
@@ -89,20 +81,20 @@ class WindowsTTS:
             sentences = [speak_text.strip()]
 
         import logging
-        _log = logging.getLogger("openclaw.voice_control")
-        _log.debug("TTS: %d sentences to speak", len(sentences))
-        for i, sentence in enumerate(sentences):
-            _log.debug("TTS sentence %d/%d: [%s]", i+1, len(sentences), sentence[:60])
+
+        logger = logging.getLogger("openclaw.voice_control")
+        logger.debug("TTS: %d sentences to speak", len(sentences))
+        for index, sentence in enumerate(sentences):
+            logger.debug("TTS sentence %d/%d: [%s]", index + 1, len(sentences), sentence[:60])
             if self.is_stop_requested():
-                _log.info("TTS: stop requested before sentence %d", i+1)
-                self.clear_stop_flag()
+                logger.info("TTS: stop requested before sentence %d", index + 1)
                 return False
             try:
-                self._voice.Speak(sentence, 0)  # synchronous
-                _log.debug("TTS sentence %d done", i+1)
+                self._voice.Speak(sentence, 0)
+                logger.debug("TTS sentence %d done", index + 1)
             except Exception as exc:
-                _log.error("TTS Speak failed on sentence %d: %s", i+1, exc)
-        _log.info("TTS: all %d sentences finished", len(sentences))
+                logger.error("TTS Speak failed on sentence %d: %s", index + 1, exc)
+        logger.info("TTS: all %d sentences finished", len(sentences))
         return True
 
     def enqueue(self, sentence: str) -> None:
@@ -113,7 +105,6 @@ class WindowsTTS:
         if not speak_text.strip():
             return
         self._sentence_queue.put(speak_text.strip())
-        # Start player thread if not already running
         if self._player_thread is None or not self._player_thread.is_alive():
             self._player_ready.clear()
             self._player_thread = threading.Thread(target=self._play_queue, daemon=True)
@@ -122,11 +113,11 @@ class WindowsTTS:
     def _play_queue(self) -> None:
         """Dedicated single-threaded queue player. Runs until queue empty or stopped."""
         import logging
-        _log = logging.getLogger("openclaw.voice_control")
+
+        logger = logging.getLogger("openclaw.voice_control")
         try:
             while True:
                 if self.is_stop_requested():
-                    # Drain remaining queue without playing
                     while True:
                         try:
                             self._sentence_queue.get_nowait()
@@ -136,12 +127,13 @@ class WindowsTTS:
                 try:
                     sentence = self._sentence_queue.get(timeout=0.3)
                 except queue.Empty:
-                    break  # queue drained naturally
+                    break
                 try:
-                    self._voice.Speak(sentence, 0)  # synchronous
-                    _log.debug("TTS queue spoke: [%s]", sentence[:40])
+                    assert self._voice is not None
+                    self._voice.Speak(sentence, 0)
+                    logger.debug("TTS queue spoke: [%s]", sentence[:40])
                 except Exception as exc:
-                    _log.error("TTS Speak failed in queue: %s", exc)
+                    logger.error("TTS Speak failed in queue: %s", exc)
         finally:
             self._player_ready.set()
 
@@ -161,9 +153,11 @@ class WindowsTTS:
     def _play_sync(sound_path: str) -> None:
         try:
             import winsound
+
             winsound.PlaySound(sound_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
         except Exception:
             import subprocess
+
             subprocess.Popen(
                 ["powershell", "-c", f"(New-Object Media.SoundPlayer '{sound_path}').PlaySync()"],
                 stdout=subprocess.DEVNULL,
