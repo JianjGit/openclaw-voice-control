@@ -1,17 +1,33 @@
 # OpenClaw Voice Control
 
-面向 OpenClaw 的无界面 Windows Voice Core SDK 与独立语音服务。
+面向 OpenClaw 的 Headless Windows Voice Core SDK 与独立语音服务。
 
-本仓库只负责语音核心能力：唤醒词、录音、ASR、本地 STT HTTP、OpenClaw Gateway 对话、Windows SAPI 朗读、运行时停止/关闭控制，以及供外部应用接入的事件/Presenter API。这里**不包含**桌宠、Qt Overlay、角色立绘、气泡、动画或其他 UI 实现。
+OpenClaw Voice Control 把 Windows 机器变成可复用的语音能力层：负责唤醒词、录音、SenseVoice/FunASR 识别、OpenClaw Gateway 对话、流式回复朗读，并通过稳定的事件/API 接口供桌宠或其他外部应用接入。
 
-## 平台与运行时
+> English: [`README.md`](README.md)
 
-- 目标平台：Windows。
-- Python 3.11+。
-- 实时 TTS 默认使用 Windows SAPI5。
-- 本地 ASR 使用 FunASR SenseVoice。
-- 默认唤醒词引擎为 openWakeWord；Porcupine 作为可选路线保留。
-- OpenClaw 对话通过 Gateway WebSocket，并保留 session JSONL fallback。
+## 功能
+
+- openWakeWord 唤醒词检测，可选 Porcupine。
+- 麦克风录音与静音自动结束判断。
+- 本地 SenseVoice / FunASR 语音识别。
+- 本地 `POST /stt` 文件识别 HTTP 接口。
+- OpenClaw Gateway WebSocket 对话，并保留 session fallback。
+- 流式回复按句进入 Windows SAPI5 TTS。
+- FIFO 朗读队列，支持停止与关闭。
+- Python SDK：文本对话、音频文件识别、主动朗读、生命周期控制。
+- 框架无关的 `Presenter` + `VoiceEvent`，用于桌宠、GUI 或其他外部程序。
+- Windows standalone 独立运行模式。
+
+核心仓库刻意不包含桌宠 UI、PySide6 Overlay、角色素材、气泡或动画逻辑。
+
+## 运行要求
+
+- Windows
+- Python 3.11+
+- 可访问的 OpenClaw Gateway
+- 本地 SenseVoice 模型文件
+- standalone 语音模式需要麦克风
 
 ## 安装
 
@@ -23,9 +39,18 @@ pip install -e ".[dev]"
 copy .env.example .env
 ```
 
-编辑 `.env`，至少配置 OpenClaw token，以及你实际使用的本地模型路径。默认 YAML 为 `config/default.yaml`。
+编辑 `.env`，至少配置 OpenClaw token，以及实际使用的本地 ASR 模型路径。默认运行配置在 [`config/default.yaml`](config/default.yaml)。
 
-启动独立服务：
+可选依赖：
+
+```powershell
+pip install -e ".[porcupine]"   # 可选 Porcupine 唤醒词
+pip install -e ".[tts-cli]"     # tts_cli.py 的可选 edge-tts/comtypes 路线
+```
+
+## 快速使用
+
+### 作为独立语音服务运行
 
 ```powershell
 .\run_service.bat
@@ -37,38 +62,149 @@ copy .env.example .env
 python -m openclaw_voice_control --config config/default.yaml --env-file .env
 ```
 
-## 公开 Python API
+standalone 的主流程：
 
-```python
-from openclaw_voice_control import (
-    ConsolePresenter,
-    NullPresenter,
-    Presenter,
-    VoiceControlService,
-    VoiceEvent,
-    VoiceEventKind,
-)
-from openclaw_voice_control.config import load_config
-
-service = VoiceControlService(load_config(), presenter=NullPresenter())
+```text
+wakeword
+  -> recording
+  -> SenseVoice / FunASR
+  -> OpenClaw Gateway
+  -> streaming reply
+  -> SpeechController
+  -> Windows SAPI5
+  -> idle
 ```
 
-稳定的服务入口：
+### 作为 Python SDK 使用
+
+```python
+from openclaw_voice_control import NullPresenter, VoiceControlService
+from openclaw_voice_control.config import load_config
+
+service = VoiceControlService(
+    load_config("config/default.yaml", ".env"),
+    presenter=NullPresenter(),
+)
+
+reply = service.ask_text("你好", speak=True)
+print(reply)
+
+service.speak_message("Voice Core 已启动。")
+service.stop_speaking()
+service.close()
+```
+
+主要公开方法：
 
 ```python
 service.transcribe_file(path, metadata=None)          # -> str
 service.ask_text(text, speak=True, metadata=None)     # -> str
 service.speak_message(text, metadata=None, wait=False)
 service.stop_speaking()
-service.run()                                         # 阻塞式独立主循环
+service.run()                                         # 阻塞式 standalone 主循环
 service.close()                                       # 幂等关闭
 ```
 
-`transcribe_file()` 与 STT HTTP 共用同一个串行化 ASR 入口。`ask_text(..., speak=True)` 会把流式完整句子按顺序送入朗读队列；`speak=False` 只返回文字。`speak_message()` 不依赖 OpenClaw、ASR、wakeword 或录音。
+桌宠和其他 GUI 应用的接入方式见 [`docs/desktop-pet-integration.md`](docs/desktop-pet-integration.md)。
 
-## 事件与 Presenter
+## 简单架构
 
-稳定事件字符串：
+主要技术：
+
+- **Wakeword：** openWakeWord，可选 Porcupine
+- **Audio：** `sounddevice` + NumPy
+- **ASR：** FunASR + SenseVoice
+- **对话：** OpenClaw Gateway WebSocket + session JSONL fallback
+- **TTS：** Windows SAPI5
+- **并发控制：** Python thread、lock、queue、runtime event
+- **外部接入：** 框架无关的 `VoiceEvent` / `Presenter`
+
+整体关系：
+
+```text
+外部应用 / 桌宠
+        │ API 调用
+        │ VoiceEvent / Presenter
+        ▼
+VoiceControlService
+  ├─ Wakeword + Recording
+  ├─ FunASR / SenseVoice
+  ├─ STT HTTP Server
+  ├─ OpenClaw Gateway Client
+  ├─ SpeechController
+  └─ Windows SAPI5
+```
+
+standalone 主循环和 SDK 共用同一套 ASR、Gateway 和朗读组件，所以桌宠不需要重新实现一套语音链路。
+
+详细架构见 [`docs/architecture.md`](docs/architecture.md)。
+
+## 项目目录
+
+```text
+openclaw-voice-control/
+├─ config/       # 默认运行配置
+├─ docs/         # 架构、模块、接入、测试与设计文档
+├─ examples/     # 外部消费方最小示例
+├─ scripts/      # TTS/STT/音频诊断工具
+├─ skills/       # OpenClaw skill 文档
+├─ src/          # openclaw_voice_control Python 包
+├─ tests/        # BE-T01..BE-T12 自动化测试
+├─ .github/      # GitHub Actions workflow
+├─ .env.example  # 环境变量模板
+├─ pyproject.toml
+└─ run_service.bat
+```
+
+## 文档导航
+
+```text
+docs/
+├─ architecture.md
+│  └─ 整体运行架构、线程、所有权和生命周期
+│
+├─ desktop-pet-integration.md
+│  └─ 桌宠 / 外部 GUI 如何调用 Voice Core API、消费事件
+│
+├─ modules/
+│  ├─ cli-and-config.md    # 配置与启动
+│  ├─ main-loop.md         # standalone 唤醒主循环
+│  ├─ wakeword.md          # 唤醒词 provider 与生命周期
+│  ├─ record.md            # 麦克风录音与静音判断
+│  ├─ asr.md               # SenseVoice / FunASR
+│  ├─ gateway-ws.md        # OpenClaw WebSocket 与回复聚合
+│  ├─ tts.md               # Windows TTS 与 SpeechController
+│  └─ events-and-text.md   # VoiceEvent 协议与文本清理
+│
+├─ same-machine-test.md
+│  └─ Windows 真机麦克风 / ASR / wakeword / SAPI / Gateway 验证
+│
+├─ fresh-clone-validation.md
+│  └─ 干净机器安装验证
+│
+├─ release-checklist.md
+│  └─ 发布前检查
+│
+└─ PRD/2026-09-09-voice-core-sdk-refactor/
+   ├─ functional-design.md # 功能行为定义
+   ├─ backend-design.md    # 后端架构和职责
+   ├─ api-design.md        # 公开 API 详细契约
+   └─ backend-dev-plan.md  # BE-01..BE-12 实施记录
+```
+
+如果你想知道“桌宠应该调用哪个接口”，先看 [`docs/desktop-pet-integration.md`](docs/desktop-pet-integration.md)；如果需要精确到字段、异常和契约，再看 PRD 里的 `api-design.md`。
+
+## Presenter 事件
+
+外部应用可以实现一个很薄的 Presenter：
+
+```python
+class MyPresenter:
+    def emit(self, event):
+        ui_queue.put(event)
+```
+
+稳定事件类型：
 
 ```text
 listening
@@ -80,109 +216,25 @@ idle
 error
 ```
 
-外部应用只需实现 Presenter：
+`Presenter.emit()` 可能来自服务线程或 Speech worker，因此 GUI 应用必须把事件切回自己的 UI 主线程。
 
-```python
-class MyPresenter:
-    def emit(self, event):
-        ui_queue.put(event)
-```
-
-`Presenter.emit()` 可能来自服务线程或 Speech worker。GUI 消费方必须自行把事件转发到自己的 UI 主线程。Presenter 抛出的异常会被核心隔离，不会拖垮语音服务。
-
-最小接入示例见 `examples/external_presenter.py`。
-
-## 常见事件流
-
-带朗读的文本对话：
-
-```text
-thinking -> speaking (0..N) -> reply -> idle
-```
-
-不朗读：
-
-```text
-thinking -> reply -> idle
-```
-
-外部主动朗读：
-
-```text
-speaking -> idle
-```
-
-独立运行模式中的可恢复错误会在对应编排边界发 `error -> idle`。
-
-## STT HTTP
-
-默认接口：
-
-```text
-POST http://127.0.0.1:15900/stt
-Content-Type: application/json
-
-{"path": "C:/audio/input.wav"}
-```
-
-成功：
-
-```json
-{"text": "识别结果"}
-```
-
-host/port 可通过 `STT_HOST` / `STT_PORT` 或 YAML 配置。`scripts/stt_endpoint_client.py` 使用相同默认值，也支持命令行覆盖。
-
-## 配置
-
-主要环境变量：
-
-```text
-OPENCLAW_BASE_URL
-OPENCLAW_WS_URL
-OPENCLAW_TOKEN
-OPENCLAW_AGENT_ID
-OPENCLAW_SESSION_KEY
-OPENCLAW_HOME
-OPENCLAW_TIMEOUT_SECONDS
-OPENCLAW_WS_TIMEOUT
-STT_HOST
-STT_PORT
-WAKEWORD_PROVIDER
-OPENWAKEWORD_MODEL_NAME
-OPENWAKEWORD_MODEL_PATH
-OPENWAKEWORD_THRESHOLD
-PICOVOICE_ACCESS_KEY
-WAKEWORD_FILE
-SENSEVOICE_MODEL_PATH
-SENSEVOICE_VAD_MODEL_PATH
-VOICE_CONTROL_CONFIG
-```
-
-当前默认值见 `.env.example` 与 `config/default.yaml`。
+最小可运行桥接示例：[`examples/external_presenter.py`](examples/external_presenter.py)。
 
 ## 工具脚本
 
-本轮保留并维护：
+- [`scripts/tts_cli.py`](scripts/tts_cli.py) — SAPI5 / 可选 edge-tts 文件合成工具。
+- [`scripts/stt_endpoint_client.py`](scripts/stt_endpoint_client.py) — 本地 `/stt` 客户端。
+- [`scripts/list_audio_devices.py`](scripts/list_audio_devices.py) — 列出音频设备。
+- [`scripts/test_microphone.py`](scripts/test_microphone.py) — 麦克风录音诊断。
 
-- `scripts/tts_cli.py`：SAPI5 / 可选 edge-tts 的文件合成工具。
-- `scripts/stt_endpoint_client.py`：本地 `/stt` 薄客户端。
-- `scripts/list_audio_devices.py`：列出音频设备。
-- `scripts/test_microphone.py`：麦克风录音诊断。
+更多说明见 [`scripts/README.md`](scripts/README.md)。
 
-旧 Overlay、launchd、macOS install/deploy/restart 脚本和静音 TTS stub 已明确删除。
+## 测试
 
-## 测试与 CI
+```powershell
+python -m pytest -q
+```
 
-`tests/` 覆盖事件协议、RuntimeControl、SpeechController 队列、ASR 串行锁、STT HTTP、`ask_text()`、`speak_message()`、单轮语音编排、Gateway 聚合/去重、配置、仓库清理、文本清理，以及外部 Presenter/API smoke test。
+自动化测试覆盖事件、RuntimeControl、朗读队列、ASR 串行化、STT HTTP、文本对话、主动朗读、standalone 编排、Gateway 聚合/去重、配置、清理回归，以及外部 Presenter/API 集成。
 
-`.github/workflows/ci.yml` 已配置为 `windows-latest` + Python 3.11，执行安装、`compileall` 和 `pytest`。真实麦克风、SenseVoice 模型执行、openWakeWord、Windows SAPI 实际出声和真实 OpenClaw Gateway 连接仍属于机器级人工集成检查，不伪装成稳定单元测试。
-
-## 文档入口
-
-- 当前架构：`docs/architecture.md`
-- 模块说明：`docs/modules/`
-- 本轮重构设计/实施记录：`docs/PRD/2026-09-09-voice-core-sdk-refactor/`
-- 外部接入示例：`examples/external_presenter.py`
-
-当前明确不属于本仓库能力范围：桌宠 UI、角色素材、动画/状态映射、follow-up 连续对话 loop，以及未经后续设计定义的 OpenClaw 主动推送监听。
+真实硬件验证见 [`docs/same-machine-test.md`](docs/same-machine-test.md)。
