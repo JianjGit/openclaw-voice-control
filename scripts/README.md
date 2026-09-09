@@ -1,29 +1,36 @@
 # Scripts
 
-This directory holds the public install and maintenance scripts.
+This directory contains the supported helper tools for the Windows Voice Core.
 
-- `deploy_macos.sh`
-- `deploy_macos.command`
-- `doctor.sh`
-- `build_host_apps.sh`
-- `start_service.sh`
-- `start_overlay.sh`
-- `restart_service.sh`
-- `restart_service.command`
-- `uninstall_macos.sh`
-- `uninstall_macos.command`
+## `tts_cli.py`
 
-These are public macOS scripts for service and overlay lifecycle management, including the host-app background startup path used for more reliable microphone permission behavior on macOS.
+File-oriented TTS helper. Supports Windows SAPI5 and optional edge-tts. This is separate from the realtime `SpeechController` queue used by the service.
 
-`uninstall_macos.sh` is also expected to clean up more than just plist files:
+Examples:
 
-- LaunchAgent registrations
-- generated host-app executables under `runtime/host_apps`
-- matching host-app processes
-- matching foreground Python test processes
+```powershell
+python scripts/tts_cli.py --text "你好" --output out.wav --backend sapi5 --voice huihui
+python scripts/tts_cli.py --text "你好" --output out.mp3 --backend edge_tts
+```
 
-This is important because manual foreground test runs can otherwise survive an
-uninstall and make it look like background uninstall failed.
+## `stt_endpoint_client.py`
 
-Use the `.sh` files from Terminal.
-Use the `.command` files when you want a Finder-double-clickable entry point on macOS.
+Thin client for the local service `POST /stt` endpoint.
+
+```powershell
+python scripts/stt_endpoint_client.py --input_path C:\audio\sample.wav
+```
+
+It reads `STT_HOST` / `STT_PORT` and also accepts `--host`, `--port`, and `--timeout` overrides.
+
+## `list_audio_devices.py`
+
+Lists audio devices visible through `sounddevice`/PortAudio. Use it to select `audio.input_device_index`.
+
+## `test_microphone.py`
+
+Simple microphone diagnostic used for machine-level validation before debugging wakeword or ASR behavior.
+
+## Removed legacy scripts
+
+macOS launchd/install/deploy/restart helpers, Overlay launchers, host-app wrappers, and the old silent `tts_simple.py` stub were removed as part of the Windows Voice Core refactor. They are not supported entrypoints.
