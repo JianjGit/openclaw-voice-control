@@ -1,19 +1,11 @@
-# 录音流程
+# Recording
 
-> 源码：`src/openclaw_voice_control/service.py` — `record_until_silence()`
+Recording is implemented by `VoiceControlService.record_until_silence()` using `sounddevice.InputStream` with 16-bit PCM.
 
----
+The service emits `listening` when recording starts. RMS energy thresholds determine speech start and end; configuration controls sample rate, input device, start timeout, minimum speech duration, end-silence duration, and maximum recording duration.
 
-```
-1. [@OpenclawVoiceControl] 创建音频输入流 (InputStream, 16000Hz, mono)
-2. LOOP 每 0.1s 取一帧 (最长 60s):
-  2.1 计算 RMS 能量
-  2.2 IF 用户还没开始说话:
-    2.2.1 连续 3 帧 RMS 超过阈值 → 判定开始说话，回溯保留之前 10 帧
-    2.2.2 超过 3s 没检测到语音 → 超时返回 None
-  2.3 ELSE: # 正在说话中
-    2.3.1 RMS 低于阈值 → 累计静音时间
-    2.3.2 连续静音 1.2s → 判定说话结束，BREAK
-3. IF 说话时长 < 0.4s: 返回 None (太短，无效)
-4. 将所有语音帧写入临时 WAV 文件 → 返回路径
-```
+A short pending-frame buffer keeps the beginning of speech when the start threshold is crossed. Valid audio is written to a temporary WAV file and deleted after the recorded turn is handled.
+
+For wakeword handoff, the caller starts a prepared recording stream once before calling `record_until_silence(prepared_stream=...)`. The recording method detects this case and does not call `start()` again.
+
+No-speech and recording failures are represented as recoverable `error` events followed by `idle`. Optional prompt sounds are handled by `SpeechController` and use Windows-compatible paths when configured.
