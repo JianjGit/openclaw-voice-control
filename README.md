@@ -2,25 +2,26 @@
 
 Headless Windows voice core SDK and standalone voice service for OpenClaw.
 
-OpenClaw Voice Control turns a Windows machine into a reusable voice layer: it listens for a wakeword or starts recording on demand, records speech, transcribes with SenseVoice/FunASR, sends text to OpenClaw Gateway, streams the reply into Windows SAPI5 TTS, and exposes a small event/API surface for desktop pets or other external applications.
+OpenClaw Voice Control turns a Windows machine into a reusable voice layer: wakeword or push-to-talk input, microphone recording, SenseVoice/FunASR ASR, OpenClaw Gateway conversation, streaming Windows SAPI5 TTS, and a small event/API surface for desktop pets or other applications.
 
 > 中文说明：[`README.zh-CN.md`](README.zh-CN.md)
 
 ## Features
 
 - Wakeword detection with openWakeWord; optional Porcupine support.
-- Push-to-talk / click-to-talk with `listen_once()` — no wakeword required.
+- Runtime input-mode switching: `wakeword` / `push_to_talk` without restarting the service.
+- Push-to-talk / click-to-talk with `listen_once()`.
 - Microphone recording with silence-based end detection.
 - Local SenseVoice / FunASR speech recognition.
 - Local `POST /stt` HTTP endpoint for file transcription.
 - OpenClaw Gateway conversation over WebSocket with session fallback.
 - Streaming sentence-by-sentence TTS through Windows SAPI5.
 - FIFO speech queue with stop / shutdown control.
-- Public Python SDK: one-shot listening, text chat, file transcription, active speech and lifecycle control.
+- Public Python SDK for voice input, text chat, transcription and active speech.
 - Framework-neutral `Presenter` + `VoiceEvent` integration for desktop pets and GUI apps.
 - Standalone Windows service mode.
 
-The core intentionally contains no desktop-pet UI, PySide6 overlay, character assets, bubbles, or animation logic.
+The core intentionally contains no desktop-pet UI, PySide6 overlay, character assets, bubbles or animation logic.
 
 ## Requirements
 
@@ -40,7 +41,7 @@ pip install -e ".[dev]"
 copy .env.example .env
 ```
 
-Edit `.env` and configure at least the OpenClaw token and the local ASR model paths you use. Default runtime settings live in [`config/default.yaml`](config/default.yaml).
+Edit `.env` and configure at least the OpenClaw token and local ASR model paths. Default runtime settings live in [`config/default.yaml`](config/default.yaml).
 
 Optional routes:
 
@@ -51,7 +52,7 @@ pip install -e ".[tts-cli]"     # optional edge-tts/comtypes helpers for tts_cli
 
 ## Quick start
 
-### Run as a standalone wakeword service
+### Start one persistent Voice Core
 
 ```powershell
 .\run_service.bat
@@ -63,7 +64,9 @@ or:
 python -m openclaw_voice_control --config config/default.yaml --env-file .env
 ```
 
-The normal standalone flow is:
+`run()` loads the core once and keeps the same ASR, Gateway, TTS, STT server and service instance alive.
+
+Default mode is `wakeword`:
 
 ```text
 wakeword
@@ -76,9 +79,90 @@ wakeword
   -> idle
 ```
 
-### Use push-to-talk without a wakeword
+### Switch input mode at runtime
 
-For a desktop-pet button, tray action, hotkey or other explicit trigger, call `listen_once()` from a background worker:
+```python
+service.set_input_mode("wakeword")
+service.set_input_mode("push_to_talk")
+```
+
+`wakeword` mode:
+
+```text
+wakeword engine listening
+```
+
+`push_to_talk` mode:
+
+```text
+wakeword engine paused
+VoiceControlService.run() still alive
+ASR / TTS / Gateway remain loaded
+wait for listen_once()
+```
+
+The wakeword engine is paused/resumed, not destroyed and rebuilt.
+
+`set_input_mode()` returns:
+
+- `True` — applied immediately;
+- `False` — queued until the current recording / ASR / Gateway / TTS activity finishes.
+
+You can inspect state with:
+
+```python
+service.get_input_mode()
+service.get_pending_input_mode()
+```
+
+When a deferred switch finally applies, the Presenter receives an `idle` event whose metadata contains:
+
+```python
+{
+    "source": "input_mode",
+    "input_mode": "push_to_talk",
+    "mode_change": "applied",
+}
+```
+
+See [`docs/input-modes.md`](docs/input-modes.md) for the full switching contract.
+
+### Push-to-talk / click-to-talk
+
+With a persistent service running, switch first:
+
+```python
+applied = service.set_input_mode("push_to_talk")
+```
+
+Then a desktop-pet button, tray action or hotkey can invoke `listen_once()` from a worker thread:
+
+```python
+ok = service.listen_once(
+    speak=True,
+    metadata={"source": "desktop_pet"},
+)
+```
+
+Flow:
+
+```text
+button / hotkey
+  -> listen_once()
+  -> recording
+  -> SenseVoice / FunASR
+  -> recognized
+  -> OpenClaw Gateway
+  -> streaming TTS when speak=True
+  -> reply
+  -> idle
+```
+
+The wakeword path and `listen_once()` share one microphone ownership lock, so they cannot open competing microphone streams.
+
+`listen_once()` also remains usable as a standalone one-shot SDK call when `run()` is not active.
+
+### Other Python SDK APIs
 
 ```python
 from openclaw_voice_control import NullPresenter, VoiceControlService
@@ -89,34 +173,7 @@ service = VoiceControlService(
     presenter=NullPresenter(),
 )
 
-ok = service.listen_once(
-    speak=True,
-    metadata={"source": "desktop_pet"},
-)
-```
-
-`listen_once()` immediately enters recording and reuses the same downstream pipeline:
-
-```text
-API trigger
-  -> recording
-  -> SenseVoice / FunASR
-  -> recognized event
-  -> OpenClaw Gateway
-  -> streaming TTS (when speak=True)
-  -> reply / idle
-```
-
-It returns `True` when the full recorded turn completes successfully and `False` when no valid speech is recorded or the recorded turn cannot complete. It does not start or wait for a wakeword.
-
-`run()` and `listen_once()` are alternative microphone-input modes and must not run at the same time. Concurrent voice-input attempts fail with `RuntimeError("voice input is already active")` instead of opening competing microphone streams.
-
-### Use other Python SDK APIs
-
-```python
 reply = service.ask_text("Hello", speak=True)
-print(reply)
-
 text = service.transcribe_file("C:/audio/input.wav")
 service.speak_message("Voice Core is ready.")
 service.stop_speaking()
@@ -126,12 +183,15 @@ service.close()
 Main public methods:
 
 ```python
+service.set_input_mode(mode)                          # -> bool
+service.get_input_mode()                              # -> str
+service.get_pending_input_mode()                      # -> str | None
 service.listen_once(speak=True, metadata=None)         # -> bool
 service.transcribe_file(path, metadata=None)          # -> str
 service.ask_text(text, speak=True, metadata=None)     # -> str
 service.speak_message(text, metadata=None, wait=False)
 service.stop_speaking()
-service.run()                                         # blocking wakeword loop
+service.run()                                         # persistent blocking service loop
 service.close()                                       # idempotent shutdown
 ```
 
@@ -146,27 +206,30 @@ Main technologies:
 - **ASR:** FunASR + SenseVoice
 - **Conversation:** OpenClaw Gateway WebSocket + session JSONL fallback
 - **TTS:** Windows SAPI5
-- **Concurrency:** Python threads, locks, queues and runtime events
+- **Concurrency:** Python threads, locks, conditions, queues and runtime events
 - **Integration:** framework-neutral `VoiceEvent` / `Presenter`
 
 High-level structure:
 
 ```text
 External App / Desktop Pet
-        │ API calls
+        │ API commands
         │ VoiceEvent / Presenter
         ▼
-VoiceControlService
-  ├─ listen_once() ───────┐
-  ├─ Wakeword + Recording ├─> shared recorded-turn pipeline
-  ├─ FunASR / SenseVoice  │
-  ├─ STT HTTP Server      │
-  ├─ OpenClaw Gateway     │
-  ├─ SpeechController     │
-  └─ Windows SAPI5        │
+VoiceControlService (persistent)
+  ├─ set_input_mode()
+  │    ├─ wakeword      -> wakeword resume
+  │    └─ push_to_talk -> wakeword pause -> listen_once()
+  ├─ shared microphone input lock
+  ├─ Recording
+  ├─ FunASR / SenseVoice
+  ├─ STT HTTP Server
+  ├─ OpenClaw Gateway
+  ├─ SpeechController
+  └─ Windows SAPI5
 ```
 
-The standalone wakeword loop and push-to-talk SDK path share the same recording, ASR, Gateway and speech components, so GUI consumers do not need a separate voice implementation.
+Input mode only decides how the next microphone turn starts. Both paths reuse the same recording, ASR, Gateway and TTS pipeline.
 
 More details: [`docs/architecture.md`](docs/architecture.md).
 
@@ -175,12 +238,12 @@ More details: [`docs/architecture.md`](docs/architecture.md).
 ```text
 openclaw-voice-control/
 ├─ config/       # default runtime configuration
-├─ docs/         # architecture, module notes, integration and validation docs
-├─ examples/     # small external-consumer examples
+├─ docs/         # architecture, module, integration and validation docs
+├─ examples/     # external-consumer examples
 ├─ scripts/      # TTS/STT/audio diagnostic utilities
 ├─ skills/       # OpenClaw skill documentation
-├─ src/          # Python package: openclaw_voice_control
-├─ tests/        # automated tests, including listen_once integration coverage
+├─ src/          # openclaw_voice_control Python package
+├─ tests/        # automated tests
 ├─ .github/      # GitHub Actions workflow
 ├─ .env.example  # environment variable template
 ├─ pyproject.toml
@@ -194,12 +257,15 @@ docs/
 ├─ architecture.md
 │  └─ overall runtime, ownership, threads and lifecycle
 │
+├─ input-modes.md
+│  └─ runtime wakeword / push-to-talk switching and safety rules
+│
 ├─ desktop-pet-integration.md
-│  └─ desktop-pet / GUI integration, including listen_once push-to-talk
+│  └─ desktop-pet / bridge API and event integration
 │
 ├─ modules/
 │  ├─ cli-and-config.md    # configuration and startup
-│  ├─ main-loop.md         # wakeword run() and one-shot listen_once input modes
+│  ├─ main-loop.md         # persistent run() and input-mode orchestration
 │  ├─ wakeword.md          # wakeword providers and lifecycle
 │  ├─ record.md            # microphone recording and silence detection
 │  ├─ asr.md               # SenseVoice / FunASR
@@ -217,23 +283,13 @@ docs/
 │  └─ pre-release checks
 │
 └─ PRD/2026-09-09-voice-core-sdk-refactor/
-   ├─ functional-design.md # expected product behavior
-   ├─ backend-design.md    # backend architecture and responsibilities
-   ├─ api-design.md        # original refactor public API contract
-   └─ backend-dev-plan.md  # BE-01..BE-12 implementation record
+   ├─ functional-design.md
+   ├─ backend-design.md
+   ├─ api-design.md
+   └─ backend-dev-plan.md
 ```
-
-If you need to answer “which API should a desktop pet call?”, start with [`docs/desktop-pet-integration.md`](docs/desktop-pet-integration.md).
 
 ## Presenter events
-
-External applications can implement a simple Presenter:
-
-```python
-class MyPresenter:
-    def emit(self, event):
-        ui_queue.put(event)
-```
 
 Stable event kinds:
 
@@ -247,16 +303,18 @@ idle
 error
 ```
 
-`Presenter.emit()` may be called from the service thread, a push-to-talk worker, or the speech worker, so GUI applications must marshal events back onto their own UI thread.
+`Presenter.emit()` may be called from the service thread, `listen_once()` worker or speech worker. GUI applications must marshal events onto their UI thread.
 
-## Utility scripts
+A minimal bridge is available at [`examples/external_presenter.py`](examples/external_presenter.py).
 
-- [`scripts/tts_cli.py`](scripts/tts_cli.py) — SAPI5 / optional edge-tts file synthesis helper.
+## Utilities
+
+- [`scripts/tts_cli.py`](scripts/tts_cli.py) — SAPI5 / optional edge-tts file synthesis.
 - [`scripts/stt_endpoint_client.py`](scripts/stt_endpoint_client.py) — local `/stt` client.
-- [`scripts/list_audio_devices.py`](scripts/list_audio_devices.py) — enumerate audio devices.
-- [`scripts/test_microphone.py`](scripts/test_microphone.py) — microphone capture diagnostic.
+- [`scripts/list_audio_devices.py`](scripts/list_audio_devices.py) — list audio devices.
+- [`scripts/test_microphone.py`](scripts/test_microphone.py) — microphone diagnostic.
 
-More details: [`scripts/README.md`](scripts/README.md).
+See [`scripts/README.md`](scripts/README.md).
 
 ## Tests
 
@@ -264,6 +322,6 @@ More details: [`scripts/README.md`](scripts/README.md).
 python -m pytest -q
 ```
 
-Automated tests cover events, runtime control, speech queue semantics, ASR serialization, STT HTTP, `listen_once()`, text conversation, active speech, standalone orchestration, Gateway aggregation/deduplication, configuration and external Presenter/API integration.
+Automated coverage includes events, runtime control, speech queue semantics, ASR serialization, STT HTTP, `listen_once()`, runtime input-mode switching, text conversation, active speech, wakeword orchestration, Gateway aggregation/deduplication, configuration and external Presenter/API integration.
 
-Real hardware validation remains documented in [`docs/same-machine-test.md`](docs/same-machine-test.md).
+Hardware-dependent validation is documented in [`docs/same-machine-test.md`](docs/same-machine-test.md).
