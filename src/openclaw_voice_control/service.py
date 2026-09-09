@@ -25,6 +25,9 @@ from .tts import WindowsTTS
 from .wakeword import build_wakeword_engine
 
 
+_VALID_INPUT_MODES = frozenset({"wakeword", "push_to_talk"})
+
+
 class VoiceControlService:
     def __init__(self, config: VoiceControlConfig, *, presenter: Presenter | None = None):
         self.config = config
@@ -39,7 +42,22 @@ class VoiceControlService:
         self.asr = FunASRSenseVoice(config.asr)
         self._asr_lock = threading.Lock()
         self._turn_lock = threading.Lock()
+
+        # _input_mode_lock serializes actual microphone ownership for both the
+        # wakeword path and listen_once(). Mode state itself uses a condition so
+        # run() can remain alive while push-to-talk mode is selected.
         self._input_mode_lock = threading.Lock()
+        self._input_mode_condition = threading.Condition(threading.RLock())
+        self._input_mode_apply_lock = threading.RLock()
+        self._wakeword_io_lock = threading.Lock()
+        self._input_mode = "wakeword"
+        self._pending_input_mode: str | None = None
+        self._active_operations = 0
+        self._service_running = False
+        self._service_ready = False
+        self._wakeword_started = False
+        self._wakeword_listening = False
+
         self._close_lock = threading.Lock()
         self._closed = False
         self.stt_server = STTServer(
@@ -50,9 +68,162 @@ class VoiceControlService:
         )
         self.wakeword = build_wakeword_engine(config.wakeword)
 
+    @staticmethod
+    def _normalize_input_mode(mode: str) -> str:
+        normalized = str(mode).strip().lower()
+        if normalized not in _VALID_INPUT_MODES:
+            raise ValueError("mode must be 'wakeword' or 'push_to_talk'")
+        return normalized
+
+    def get_input_mode(self) -> str:
+        """Return the currently applied microphone input mode."""
+        with self._input_mode_condition:
+            return self._input_mode
+
+    def get_pending_input_mode(self) -> str | None:
+        """Return a queued mode change, if the current activity must finish first."""
+        with self._input_mode_condition:
+            return self._pending_input_mode
+
+    def set_input_mode(self, mode: str) -> bool:
+        """Switch microphone input mode without rebuilding the service.
+
+        Returns True when the requested mode is applied before this method
+        returns. Returns False when the change is queued until the current
+        recording / ASR / Gateway / TTS activity releases the voice pipeline.
+        """
+        target = self._normalize_input_mode(mode)
+        with self._input_mode_apply_lock:
+            with self._input_mode_condition:
+                if self._closed:
+                    raise RuntimeError("VoiceControlService is closed")
+                if target == self._input_mode:
+                    self._pending_input_mode = None
+                    self._input_mode_condition.notify_all()
+                    return True
+                self._pending_input_mode = target
+                if self._active_operations:
+                    self.logger.info(
+                        "Input mode change queued until current activity finishes | current=%s target=%s",
+                        self._input_mode,
+                        target,
+                    )
+                    self._input_mode_condition.notify_all()
+                    return False
+
+            applied = self._apply_pending_input_mode_if_idle()
+            if not applied:
+                self.logger.info(
+                    "Input mode change queued until microphone is released | current=%s target=%s",
+                    self.get_input_mode(),
+                    target,
+                )
+            return applied
+
+    def _begin_activity(self) -> None:
+        condition = getattr(self, "_input_mode_condition", None)
+        if condition is None:
+            return
+        with condition:
+            self._active_operations += 1
+
+    def _end_activity(self) -> None:
+        condition = getattr(self, "_input_mode_condition", None)
+        if condition is None:
+            return
+        with condition:
+            self._active_operations -= 1
+            if self._active_operations < 0:
+                self._active_operations = 0
+                raise RuntimeError("voice activity counter underflow")
+            should_apply = self._active_operations == 0 and self._pending_input_mode is not None
+            condition.notify_all()
+        if should_apply:
+            self._apply_pending_input_mode_if_idle()
+
+    def _set_wakeword_listening(self, enabled: bool) -> None:
+        with self._wakeword_io_lock:
+            if enabled:
+                if not self._wakeword_started:
+                    self._start_wakeword_engine()
+                elif not self._wakeword_listening:
+                    self.wakeword.resume()
+                    self._wakeword_listening = True
+                return
+
+            if self._wakeword_started and self._wakeword_listening:
+                self.wakeword.pause()
+                self._wakeword_listening = False
+
+    def _apply_pending_input_mode_if_idle(self) -> bool:
+        apply_lock = getattr(self, "_input_mode_apply_lock", None)
+        if apply_lock is None:
+            return True
+        with apply_lock:
+            condition = getattr(self, "_input_mode_condition", None)
+            if condition is None:
+                return True
+
+            with condition:
+                target = self._pending_input_mode
+                if target is None:
+                    return True
+                if self._active_operations:
+                    return False
+
+            # The same lock is used by wakeword reads/turns and listen_once(), so
+            # mode application can never open/resume a microphone while another
+            # input path owns it.
+            if not self._input_mode_lock.acquire(timeout=0.25):
+                return False
+
+            try:
+                with condition:
+                    target = self._pending_input_mode
+                    if target is None:
+                        return True
+                    if self._active_operations:
+                        return False
+                    service_running = self._service_running
+
+                if service_running:
+                    self._set_wakeword_listening(target == "wakeword")
+
+                with condition:
+                    # A newer request may have replaced this target while wakeword
+                    # I/O was being synchronized. Only commit the target we applied.
+                    if self._pending_input_mode != target:
+                        return False
+                    self._input_mode = target
+                    self._pending_input_mode = None
+                    condition.notify_all()
+            finally:
+                self._input_mode_lock.release()
+
+            self.logger.info("Input mode changed | mode=%s", target)
+            self._emit(
+                VoiceEvent(
+                    kind=VoiceEventKind.IDLE,
+                    metadata={
+                        "source": "input_mode",
+                        "input_mode": target,
+                        "mode_change": "applied",
+                    },
+                )
+            )
+            return True
+
     def _start_wakeword_engine(self) -> None:
+        if self._wakeword_started:
+            if not self._wakeword_listening:
+                self.wakeword.resume()
+                self._wakeword_listening = True
+            return
+
         self.logger.info("Initializing wakeword engine...")
         self.wakeword.start()
+        self._wakeword_started = True
+        self._wakeword_listening = True
         if self.config.wakeword.provider.strip().lower() == "openwakeword":
             self.logger.info(
                 "Wakeword engine ready | provider=%s model_name=%s model_path=%s threshold=%.2f",
@@ -107,8 +278,13 @@ class VoiceControlService:
         audio_path = Path(path).expanduser()
         if not audio_path.is_file():
             raise FileNotFoundError(str(audio_path))
-        with self._asr_lock:
-            return self.asr.transcribe(str(audio_path))
+
+        self._begin_activity()
+        try:
+            with self._asr_lock:
+                return self.asr.transcribe(str(audio_path))
+        finally:
+            self._end_activity()
 
     def listen_once(
         self,
@@ -117,11 +293,30 @@ class VoiceControlService:
         metadata: Mapping[str, Any] | None = None,
     ) -> bool:
         """Run one push-to-talk voice turn without waiting for a wakeword."""
+        condition = getattr(self, "_input_mode_condition", None)
+        if condition is not None:
+            with condition:
+                if self._service_running and not self._service_ready:
+                    raise RuntimeError("Voice service is not ready")
+                if self._service_running and self._input_mode != "push_to_talk":
+                    raise RuntimeError("listen_once requires push_to_talk input mode while run() is active")
+
         if not self._input_mode_lock.acquire(blocking=False):
             raise RuntimeError("voice input is already active")
 
+        activity_started = False
         event_metadata = {"source": "listen_once", **dict(metadata or {})}
         try:
+            if condition is not None:
+                with condition:
+                    if self._service_running and not self._service_ready:
+                        raise RuntimeError("Voice service is not ready")
+                    if self._service_running and self._input_mode != "push_to_talk":
+                        raise RuntimeError(
+                            "listen_once requires push_to_talk input mode while run() is active"
+                        )
+            self._begin_activity()
+            activity_started = True
             self.speech.clear_stop_request()
             try:
                 wav_path = self.record_until_silence(metadata=event_metadata)
@@ -151,6 +346,10 @@ class VoiceControlService:
             )
         finally:
             self._input_mode_lock.release()
+            if activity_started:
+                self._end_activity()
+            else:
+                self._apply_pending_input_mode_if_idle()
 
     def ask_text(
         self,
@@ -163,54 +362,58 @@ class VoiceControlService:
         if not user_text:
             raise ValueError("text must not be empty")
 
-        event_metadata = dict(metadata or {})
-        with self._turn_lock:
-            if speak:
-                self.speech.clear_stop_request()
-            self._emit(
-                VoiceEvent(
-                    kind=VoiceEventKind.THINKING,
-                    user_text=user_text,
-                    metadata=event_metadata,
-                )
-            )
-            try:
+        self._begin_activity()
+        try:
+            event_metadata = dict(metadata or {})
+            with self._turn_lock:
                 if speak:
-                    def on_sentence(sentence: str) -> None:
-                        self.speech.enqueue(sentence, metadata=event_metadata)
-
-                    reply = self.client.ask_streaming(user_text, on_sentence=on_sentence)
-                else:
-                    reply = self.client.ask(user_text)
-            except Exception as exc:
+                    self.speech.clear_stop_request()
                 self._emit(
                     VoiceEvent(
-                        kind=VoiceEventKind.ERROR,
-                        text=str(exc),
+                        kind=VoiceEventKind.THINKING,
                         user_text=user_text,
-                        metadata={
-                            **event_metadata,
-                            "stage": "gateway",
-                            "exception_type": type(exc).__name__,
-                            "recoverable": True,
-                        },
+                        metadata=event_metadata,
                     )
                 )
-                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
-                raise
+                try:
+                    if speak:
+                        def on_sentence(sentence: str) -> None:
+                            self.speech.enqueue(sentence, metadata=event_metadata)
 
-            self._emit(
-                VoiceEvent(
-                    kind=VoiceEventKind.REPLY,
-                    text=reply,
-                    user_text=user_text,
-                    metadata=event_metadata,
+                        reply = self.client.ask_streaming(user_text, on_sentence=on_sentence)
+                    else:
+                        reply = self.client.ask(user_text)
+                except Exception as exc:
+                    self._emit(
+                        VoiceEvent(
+                            kind=VoiceEventKind.ERROR,
+                            text=str(exc),
+                            user_text=user_text,
+                            metadata={
+                                **event_metadata,
+                                "stage": "gateway",
+                                "exception_type": type(exc).__name__,
+                                "recoverable": True,
+                            },
+                        )
+                    )
+                    self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+                    raise
+
+                self._emit(
+                    VoiceEvent(
+                        kind=VoiceEventKind.REPLY,
+                        text=reply,
+                        user_text=user_text,
+                        metadata=event_metadata,
+                    )
                 )
-            )
-            if speak:
-                self.speech.wait_done()
-            self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
-            return reply
+                if speak:
+                    self.speech.wait_done()
+                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+                return reply
+        finally:
+            self._end_activity()
 
     def speak_message(
         self,
@@ -224,24 +427,34 @@ class VoiceControlService:
             raise ValueError("text must not be empty")
         event_metadata = dict(metadata or {})
         self.speech.clear_stop_request()
+        self._begin_activity()
+        completion_releases_activity = False
 
         def on_complete(success: bool, error: BaseException | None) -> None:
             del success, error
-            if not self.runtime.is_stop_speech_requested():
-                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+            try:
+                if not self.runtime.is_stop_speech_requested():
+                    self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+            finally:
+                self._end_activity()
 
-        item = self.speech.enqueue(
-            message,
-            metadata=event_metadata,
-            on_complete=on_complete,
-        )
-        if item is None:
-            self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
-            return
-        if wait:
-            item.completion.wait()
-            if item.error is not None:
-                raise item.error
+        try:
+            item = self.speech.enqueue(
+                message,
+                metadata=event_metadata,
+                on_complete=on_complete,
+            )
+            if item is None:
+                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+                return
+            completion_releases_activity = True
+            if wait:
+                item.completion.wait()
+                if item.error is not None:
+                    raise item.error
+        finally:
+            if not completion_releases_activity:
+                self._end_activity()
 
     def stop_speaking(self) -> None:
         self.speech.stop(timeout=None, emit_idle=False)
@@ -251,17 +464,27 @@ class VoiceControlService:
                 metadata={"source": "stop_speaking"},
             )
         )
+        self._apply_pending_input_mode_if_idle()
 
     def close(self) -> None:
         with self._close_lock:
             if self._closed:
                 return
             self._closed = True
+
         self.runtime.request_shutdown()
+        condition = getattr(self, "_input_mode_condition", None)
+        if condition is not None:
+            with condition:
+                condition.notify_all()
+
         self.stt_server.close()
         self.speech.close()
         try:
-            self.wakeword.close()
+            with self._wakeword_io_lock:
+                self.wakeword.close()
+                self._wakeword_started = False
+                self._wakeword_listening = False
         except Exception:
             self.logger.exception("Failed to close wakeword engine")
         self.client.close()
@@ -470,8 +693,13 @@ class VoiceControlService:
                     self.logger.exception("Failed to remove temp wav file: %s", wav_path)
 
     def run(self) -> None:
-        if not self._input_mode_lock.acquire(blocking=False):
-            raise RuntimeError("voice input is already active")
+        with self._input_mode_condition:
+            if self._service_running:
+                raise RuntimeError("VoiceControlService.run() is already active")
+            self._service_running = True
+            self._service_ready = False
+            self._input_mode_condition.notify_all()
+
         try:
             try:
                 self._run_service()
@@ -488,7 +716,10 @@ class VoiceControlService:
                 self.logger.info("Crash dump written to %s", str(crash_log))
                 raise
         finally:
-            self._input_mode_lock.release()
+            with self._input_mode_condition:
+                self._service_running = False
+                self._service_ready = False
+                self._input_mode_condition.notify_all()
             self.close()
 
     def _run_service(self) -> None:
@@ -502,10 +733,27 @@ class VoiceControlService:
         self.asr.load()
         self.logger.info("ASR model ready")
         self.stt_server.start()
-        self._start_wakeword_engine()
+
+        if self.get_input_mode() == "wakeword":
+            if not self._input_mode_lock.acquire(blocking=False):
+                raise RuntimeError("voice input is already active")
+            try:
+                self._set_wakeword_listening(True)
+            finally:
+                self._input_mode_lock.release()
+
+        with self._input_mode_condition:
+            self._service_ready = True
+            self._input_mode_condition.notify_all()
+
         self.speech.clear_stop_request()
-        self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "startup"}))
-        self.logger.info("Entered idle listening loop")
+        self._emit(
+            VoiceEvent(
+                kind=VoiceEventKind.IDLE,
+                metadata={"source": "startup", "input_mode": self.get_input_mode()},
+            )
+        )
+        self.logger.info("Voice service ready | input_mode=%s", self.get_input_mode())
 
         next_allowed_trigger_time = 0.0
         wakeword_armed = True
@@ -515,68 +763,122 @@ class VoiceControlService:
             next_allowed_trigger_time = max(next_allowed_trigger_time, time.time() + seconds)
 
         while not self.runtime.is_shutdown_requested():
-            _, keyword_index = self.wakeword.read()
-            if not wakeword_armed:
-                continue
-            if keyword_index < 0:
+            self._apply_pending_input_mode_if_idle()
+
+            with self._input_mode_condition:
+                if self._input_mode != "wakeword":
+                    self._input_mode_condition.wait(timeout=0.1)
+                    continue
+
+            if not self._input_mode_lock.acquire(timeout=0.1):
                 continue
 
-            now = time.time()
-            if now < next_allowed_trigger_time:
-                continue
-            next_allowed_trigger_time = now + self.config.wakeword.cooldown_seconds
-            wakeword_armed = False
-            self.logger.info("Wakeword detected")
-
-            self.speech.clear_stop_request()
-            wake_ok = self.speech.speak(
-                self.config.tts.wake_ack,
-                metadata={"source": "wakeword_ack"},
-                clean_markdown=False,
-            )
-            if not wake_ok or self.speech.is_stop_requested():
-                wakeword_armed = True
-                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "wakeword"}))
-                self.speech.clear_stop_request()
-                continue
-
-            block_size = int(self.config.audio.sample_rate * 0.1)
-            prepared_stream = self._build_record_stream(block_size)
-            wav_path: Optional[str] = None
+            activity_started = False
             try:
-                self.wakeword.pause()
-                prepared_stream.start()
-                wav_path = self.record_until_silence(prepared_stream=prepared_stream)
-            except Exception as exc:
-                self.logger.exception("Failed to hand off from wakeword listening to recording")
-                try:
-                    prepared_stream.stop()
-                    prepared_stream.close()
-                except Exception:
-                    self.logger.exception("Failed to close prepared recording stream after handoff failure")
-                self._emit(
-                    VoiceEvent(
-                        kind=VoiceEventKind.ERROR,
-                        text=str(exc),
-                        metadata={
-                            "source": "wakeword",
-                            "stage": "recording",
-                            "exception_type": type(exc).__name__,
-                            "recoverable": True,
-                        },
-                    )
-                )
-                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "wakeword"}))
-            finally:
-                if not self.runtime.is_shutdown_requested():
-                    self.wakeword.resume()
+                with self._input_mode_condition:
+                    if self._input_mode != "wakeword":
+                        continue
+                    if self._pending_input_mode == "push_to_talk":
+                        continue
 
-            if not wav_path:
+                with self._wakeword_io_lock:
+                    if not self._wakeword_started:
+                        self._start_wakeword_engine()
+                    elif not self._wakeword_listening:
+                        self.wakeword.resume()
+                        self._wakeword_listening = True
+                    _, keyword_index = self.wakeword.read()
+
+                if not wakeword_armed:
+                    continue
+                if keyword_index < 0:
+                    continue
+
+                now = time.time()
+                if now < next_allowed_trigger_time:
+                    continue
+
+                # Atomically claim the current turn before a mode switch can be
+                # applied. Any request after this point becomes pending.
+                with self._input_mode_condition:
+                    if self._input_mode != "wakeword":
+                        continue
+                    if self._pending_input_mode == "push_to_talk":
+                        continue
+                    self._active_operations += 1
+                    activity_started = True
+
+                next_allowed_trigger_time = now + self.config.wakeword.cooldown_seconds
+                wakeword_armed = False
+                self.logger.info("Wakeword detected")
+
+                # Keep the wakeword model loaded but close its microphone for
+                # the entire recorded conversation, including ASR/Gateway/TTS.
+                with self._wakeword_io_lock:
+                    if self._wakeword_started and self._wakeword_listening:
+                        self.wakeword.pause()
+                        self._wakeword_listening = False
+
+                self.speech.clear_stop_request()
+                wake_ok = self.speech.speak(
+                    self.config.tts.wake_ack,
+                    metadata={"source": "wakeword_ack"},
+                    clean_markdown=False,
+                )
+                if not wake_ok or self.speech.is_stop_requested():
+                    self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "wakeword"}))
+                    self.speech.clear_stop_request()
+                    continue
+
+                block_size = int(self.config.audio.sample_rate * 0.1)
+                prepared_stream = self._build_record_stream(block_size)
+                wav_path: Optional[str] = None
+                try:
+                    prepared_stream.start()
+                    wav_path = self.record_until_silence(prepared_stream=prepared_stream)
+                except Exception as exc:
+                    self.logger.exception("Failed to hand off from wakeword to recording")
+                    try:
+                        prepared_stream.stop()
+                        prepared_stream.close()
+                    except Exception:
+                        self.logger.exception("Failed to close prepared recording stream after handoff failure")
+                    self._emit(
+                        VoiceEvent(
+                            kind=VoiceEventKind.ERROR,
+                            text=str(exc),
+                            metadata={
+                                "source": "wakeword",
+                                "stage": "recording",
+                                "exception_type": type(exc).__name__,
+                                "recoverable": True,
+                            },
+                        )
+                    )
+                    self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "wakeword"}))
+
+                if not wav_path:
+                    extend_rearm(self.config.wakeword.rearm_seconds_after_turn)
+                    wakeword_armed = True
+                    self.speech.clear_stop_request()
+                    continue
+
+                self.handle_one_turn(wav_path)
                 extend_rearm(self.config.wakeword.rearm_seconds_after_turn)
                 wakeword_armed = True
-                self.speech.clear_stop_request()
-                continue
+            finally:
+                if activity_started:
+                    with self._input_mode_condition:
+                        should_resume_wakeword = (
+                            not self.runtime.is_shutdown_requested()
+                            and self._input_mode == "wakeword"
+                            and self._pending_input_mode is None
+                        )
+                    if should_resume_wakeword:
+                        self._set_wakeword_listening(True)
 
-            self.handle_one_turn(wav_path)
-            extend_rearm(self.config.wakeword.rearm_seconds_after_turn)
-            wakeword_armed = True
+                self._input_mode_lock.release()
+                if activity_started:
+                    self._end_activity()
+                else:
+                    self._apply_pending_input_mode_if_idle()
