@@ -38,8 +38,9 @@ class RecordingLogger:
 
 def _config(tmp_path):
     return SimpleNamespace(
-        app=SimpleNamespace(log_dir=tmp_path / "logs", runtime_dir=tmp_path / "runtime", log_level="INFO"),
+        app=SimpleNamespace(log_dir=tmp_path / "logs", log_level="INFO"),
         openclaw=object(),
+        stt=SimpleNamespace(host="127.0.0.1", port=15900),
         tts=object(),
         asr=object(),
         wakeword=SimpleNamespace(provider="openwakeword"),
