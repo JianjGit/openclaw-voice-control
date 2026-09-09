@@ -6,6 +6,12 @@ This directory contains the supported helper tools for the Windows Voice Core.
 
 File-oriented TTS helper. Supports Windows SAPI5 and optional edge-tts. This is separate from the realtime `SpeechController` queue used by the service.
 
+Install its optional dependencies with:
+
+```powershell
+pip install -e ".[tts-cli]"
+```
+
 Examples:
 
 ```powershell
@@ -30,6 +36,14 @@ Lists audio devices visible through `sounddevice`/PortAudio. Use it to select `a
 ## `test_microphone.py`
 
 Simple microphone diagnostic used for machine-level validation before debugging wakeword or ASR behavior.
+
+## Optional Porcupine route
+
+The core defaults to openWakeWord. Install the optional Porcupine dependencies only when that provider is selected:
+
+```powershell
+pip install -e ".[porcupine]"
+```
 
 ## Removed legacy scripts
 
