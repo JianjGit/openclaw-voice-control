@@ -2,15 +2,20 @@ app:
   name: openclaw-voice-control
   platform: windows
   log_dir: logs
-  runtime_dir: runtime
   log_level: INFO
 
 openclaw:
   base_url: ${OPENCLAW_BASE_URL}
+  ws_url: ${OPENCLAW_WS_URL}
   agent_id: ${OPENCLAW_AGENT_ID}
-  model: ${OPENCLAW_MODEL}
-  user: ${OPENCLAW_USER}
+  session_key: ${OPENCLAW_SESSION_KEY}
+  home_dir: ${OPENCLAW_HOME}
   timeout_seconds: 120
+  ws_timeout: 30
+
+stt:
+  host: 127.0.0.1
+  port: 15900
 
 audio:
   sample_rate: 16000
@@ -44,13 +49,7 @@ tts:
   record_done_sound:
   no_speech_beep_enabled: false
   no_speech_sound:
-  post_reply_delay: 0.5
-
-overlay:
-  enabled: false
-  state_file: runtime/overlay_state.json
-  stop_flag_file: runtime/stop_tts.flag
-  poll_interval_ms: 150
+  post_reply_delay: 0.0
 
 asr:
   provider: funasr
