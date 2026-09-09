@@ -29,7 +29,6 @@ class VoiceControlService:
     def __init__(self, config: VoiceControlConfig, *, presenter: Presenter | None = None):
         self.config = config
         self.config.app.log_dir.mkdir(parents=True, exist_ok=True)
-        self.config.app.runtime_dir.mkdir(parents=True, exist_ok=True)
 
         self.logger = self._build_logger()
         self.presenter: Presenter = presenter or NullPresenter()
@@ -42,7 +41,12 @@ class VoiceControlService:
         self._turn_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._closed = False
-        self.stt_server = STTServer(self.transcribe_file, logger=self.logger)
+        self.stt_server = STTServer(
+            self.transcribe_file,
+            host=config.stt.host,
+            port=config.stt.port,
+            logger=self.logger,
+        )
         self.wakeword = build_wakeword_engine(config.wakeword)
 
     def _start_wakeword_engine(self) -> None:
@@ -262,7 +266,6 @@ class VoiceControlService:
         stream = prepared_stream or self._build_record_stream(block_size)
 
         try:
-            # A prepared stream is explicitly already started by the wakeword handoff caller.
             if prepared_stream is None:
                 stream.start()
             while total_time < audio.max_record_seconds:
@@ -399,7 +402,6 @@ class VoiceControlService:
             try:
                 reply = self.ask_text(user_text, speak=True, metadata=event_metadata)
             except Exception:
-                # ask_text emits gateway error -> idle and preserves the exception for SDK callers.
                 self.logger.exception("OpenClaw turn failed")
                 return False
             self.logger.info("Reply: %s", reply[:100] if reply else "(empty)")
