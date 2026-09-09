@@ -51,7 +51,7 @@ def test_be_t07_recorded_turn_emits_recognized_and_reuses_public_api(tmp_path) -
     service.logger = FakeLogger()
     service.events = []
     service._emit = service.events.append
-    service.transcribe_file = lambda path: "hello"
+    service.transcribe_file = lambda path, metadata=None: "hello"
     calls = []
 
     def ask_text(text: str, *, speak: bool = True, metadata=None) -> str:
@@ -76,7 +76,7 @@ def test_be_t07_asr_failure_emits_error_idle_and_keeps_turn_recoverable(tmp_path
     service.events = []
     service._emit = service.events.append
 
-    def fail_transcribe(_path):
+    def fail_transcribe(_path, metadata=None):
         raise RuntimeError("asr failed")
 
     service.transcribe_file = fail_transcribe
