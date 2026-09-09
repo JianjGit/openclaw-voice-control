@@ -18,7 +18,9 @@ import sounddevice as sd
 
 from .asr import FunASRSenseVoice
 from .config import VoiceControlConfig
+from .events import VoiceEvent
 from .openclaw_client import OpenClawClient
+from .presenter import NullPresenter, Presenter
 from .state import OverlayStateManager
 from .text import clean_text_for_overlay
 from .tts import WindowsTTS
@@ -26,12 +28,13 @@ from .wakeword import build_wakeword_engine
 
 
 class VoiceControlService:
-    def __init__(self, config: VoiceControlConfig):
+    def __init__(self, config: VoiceControlConfig, *, presenter: Presenter | None = None):
         self.config = config
         self.config.app.log_dir.mkdir(parents=True, exist_ok=True)
         self.config.app.runtime_dir.mkdir(parents=True, exist_ok=True)
 
         self.logger = self._build_logger()
+        self.presenter: Presenter = presenter or NullPresenter()
         self.client = OpenClawClient(config.openclaw)
         self.tts = WindowsTTS(config.tts, config.overlay)
         self.asr = FunASRSenseVoice(config.asr)
@@ -91,6 +94,13 @@ class VoiceControlService:
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
         return logger
+
+    def _emit(self, event: VoiceEvent) -> None:
+        """Emit a core event without allowing presenter failures to stop the service."""
+        try:
+            self.presenter.emit(event)
+        except Exception:
+            self.logger.exception("Presenter failed while handling %s", event.kind.value)
 
     def update_overlay_state(
         self,
