@@ -10,7 +10,7 @@
 - [x] BE-06 外部主动朗读 API — `BE-T06` FIFO、单条 wait、stop 与 metadata 测试通过，提交 `4d070b4`。
 - [x] BE-07 VoiceControlService 主循环迁移 — `BE-T07` 单轮编排、录音交接、Presenter 事件与 wakeword pause/resume 测试通过，提交 `e764bae`。
 - [x] BE-08 Gateway WebSocket 与流式回复稳定化 — `BE-T08` WS/session 去重、ACK 早到事件、配置超时与 close 生命周期测试通过，提交 `b366b67`。
-- [ ] BE-09 配置、依赖与公开导入面整理
+- [x] BE-09 配置、依赖与公开导入面整理 — `BE-T09` 配置默认值、环境变量覆盖、依赖元数据与公共导入面检查通过，提交 `a5df250` / `7b76126` / `eecfc4f`。
 - [ ] BE-10 删除 Overlay 与旧平台残留
 - [ ] BE-11 自动化测试与 Windows CI
 - [ ] BE-12 文档校准与外部消费方集成验证
