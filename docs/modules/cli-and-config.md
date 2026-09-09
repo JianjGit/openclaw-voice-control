@@ -1,19 +1,19 @@
-# CLI & 配置加载流程
+# CLI and Configuration
 
-> 源码：`src/openclaw_voice_control/cli.py`, `config.py`
+`cli.py` is the standalone entrypoint. It loads YAML plus an optional `.env` file, constructs `VoiceControlService`, and calls the blocking `run()` lifecycle.
 
----
+Configuration is defined in `config.py` with typed dataclasses for app, OpenClaw, STT, audio, wakeword, TTS, and ASR settings. There is no Overlay/runtime-state configuration.
 
-```
-1. [@OpenclawVoiceControl] 解析命令行参数 (--config, --env-file)
-2. 加载 .env 环境变量
-3. 读取 YAML 配置文件，替换 ${VAR} 占位符
-4. 构造 {VoiceControlConfig} 数据类（含各子配置）
-5. 实例化 {VoiceControlService}，调用 run()
-```
+The default file is `config/default.yaml`. `VOICE_CONTROL_CONFIG` can select another file.
 
-## 配置优先级
+Important environment overrides include:
 
-```
-.env 环境变量 > YAML 文件值 > 代码默认值
-```
+- `OPENCLAW_BASE_URL`, `OPENCLAW_WS_URL`, `OPENCLAW_TOKEN`
+- `OPENCLAW_AGENT_ID`, `OPENCLAW_SESSION_KEY`, `OPENCLAW_HOME`
+- `OPENCLAW_TIMEOUT_SECONDS`, `OPENCLAW_WS_TIMEOUT`
+- `STT_HOST`, `STT_PORT`
+- `WAKEWORD_PROVIDER`, `OPENWAKEWORD_MODEL_NAME`, `OPENWAKEWORD_MODEL_PATH`, `OPENWAKEWORD_THRESHOLD`
+- `PICOVOICE_ACCESS_KEY`, `WAKEWORD_FILE`
+- `SENSEVOICE_MODEL_PATH`, `SENSEVOICE_VAD_MODEL_PATH`
+
+The platform default is Windows. Default prompt-sound paths are empty rather than macOS system paths.
