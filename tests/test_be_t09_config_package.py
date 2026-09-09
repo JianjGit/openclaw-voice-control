@@ -80,13 +80,18 @@ def test_be_t09_pyproject_matches_actual_headless_dependencies() -> None:
     root = Path(__file__).resolve().parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = "\n".join(project["project"]["dependencies"]).lower()
+    extras = project["project"]["optional-dependencies"]
     scripts = project["project"]["scripts"]
 
     assert "pyside6" not in dependencies
+    assert "torchcodec" not in dependencies
     assert "websockets" in dependencies
     assert "pywin32" in dependencies
-    assert "comtypes" in dependencies
-    assert "edge-tts" in dependencies
+    assert "comtypes" not in dependencies
+    assert "edge-tts" not in dependencies
+    assert any("pvporcupine" in item.lower() for item in extras["porcupine"])
+    assert any("comtypes" in item.lower() for item in extras["tts-cli"])
+    assert any("edge-tts" in item.lower() for item in extras["tts-cli"])
     assert "openclaw-overlay" not in scripts
 
 
