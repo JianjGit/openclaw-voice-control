@@ -16,7 +16,7 @@ import sounddevice as sd
 
 from .asr import FunASRSenseVoice
 from .config import VoiceControlConfig
-from .events import VoiceEvent
+from .events import VoiceEvent, VoiceEventKind
 from .openclaw_client import OpenClawClient
 from .presenter import NullPresenter, Presenter
 from .runtime import RuntimeControl
@@ -42,6 +42,7 @@ class VoiceControlService:
         self.speech = SpeechController(self.tts, self.runtime, self._emit, logger=self.logger)
         self.asr = FunASRSenseVoice(config.asr)
         self._asr_lock = threading.Lock()
+        self._turn_lock = threading.Lock()
         self.stt_server = STTServer(self.transcribe_file, logger=self.logger)
         self.wakeword = build_wakeword_engine(config.wakeword)
         self.state = OverlayStateManager(config.overlay)
@@ -100,7 +101,6 @@ class VoiceControlService:
         return logger
 
     def _emit(self, event: VoiceEvent) -> None:
-        """Emit a core event without allowing presenter failures to stop the service."""
         try:
             self.presenter.emit(event)
         except Exception:
@@ -112,13 +112,67 @@ class VoiceControlService:
         *,
         metadata: Mapping[str, Any] | None = None,
     ) -> str:
-        """Transcribe an audio file through the service-wide serialized ASR path."""
-        del metadata  # reserved for future tracing without changing ASR semantics
+        del metadata
         audio_path = Path(path).expanduser()
         if not audio_path.is_file():
             raise FileNotFoundError(str(audio_path))
         with self._asr_lock:
             return self.asr.transcribe(str(audio_path))
+
+    def ask_text(
+        self,
+        text: str,
+        *,
+        speak: bool = True,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        user_text = text.strip()
+        if not user_text:
+            raise ValueError("text must not be empty")
+
+        event_metadata = dict(metadata or {})
+        with self._turn_lock:
+            if speak:
+                self.speech.clear_stop_request()
+            self._emit(
+                VoiceEvent(
+                    kind=VoiceEventKind.THINKING,
+                    user_text=user_text,
+                    metadata=event_metadata,
+                )
+            )
+            try:
+                if speak:
+                    def on_sentence(sentence: str) -> None:
+                        self.speech.enqueue(sentence, metadata=event_metadata)
+
+                    reply = self.client.ask_streaming(user_text, on_sentence=on_sentence)
+                else:
+                    reply = self.client.ask(user_text)
+            except Exception as exc:
+                self._emit(
+                    VoiceEvent(
+                        kind=VoiceEventKind.ERROR,
+                        text=str(exc),
+                        user_text=user_text,
+                        metadata={**event_metadata, "stage": "gateway"},
+                    )
+                )
+                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+                raise
+
+            self._emit(
+                VoiceEvent(
+                    kind=VoiceEventKind.REPLY,
+                    text=reply,
+                    user_text=user_text,
+                    metadata=event_metadata,
+                )
+            )
+            if speak:
+                self.speech.wait_done()
+            self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+            return reply
 
     def update_overlay_state(
         self,
@@ -247,45 +301,27 @@ class VoiceControlService:
             self.logger.info("ASR: %s", user_text[:100] if user_text else "(empty)")
             if not user_text:
                 self.update_overlay_state("no_speech", meta_text="没有识别出有效文本", auto_hide_ms=2200)
-                self.speech.clear_stop_request()
                 return False
 
             self.update_overlay_state("recognized", user_text=user_text, meta_text="识别完成", auto_hide_ms=1800)
             self.update_overlay_state("thinking", user_text=user_text, meta_text="正在思考", auto_hide_ms=0)
-
-            self.speech.clear_stop_request()
-
-            def on_sentence(sentence: str) -> None:
-                self.speech.enqueue(sentence)
-
-            reply = self.client.ask_streaming(user_text, on_sentence=on_sentence)
+            reply = self.ask_text(user_text, speak=True)
             self.logger.info("Reply: %s", reply[:100] if reply else "(empty)")
-
-            if self.speech.is_stop_requested():
-                self.update_overlay_state("idle", auto_hide_ms=120)
-                return False
-
             reply_clean = clean_text_for_overlay(reply)
             self.update_overlay_state("reply", user_text=user_text, reply_text=reply_clean, meta_text="Jarvis", auto_hide_ms=0)
-
-            self.speech.wait_done()
             if reply:
                 time.sleep(self.config.tts.post_reply_delay)
-
             self.update_overlay_state("idle", auto_hide_ms=120)
-            self.speech.clear_stop_request()
             return True
         except requests.HTTPError:
             self.logger.exception("OpenClaw request failed")
             self.update_overlay_state("no_speech", meta_text="请求失败", auto_hide_ms=2200)
             self.speech.speak("请求失败。", clean_markdown=False)
-            self.speech.clear_stop_request()
             return False
         except Exception:
             self.logger.exception("Unexpected error during turn handling")
             self.update_overlay_state("no_speech", meta_text="出了点问题", auto_hide_ms=2200)
             self.speech.speak("出了点问题。", clean_markdown=False)
-            self.speech.clear_stop_request()
             return False
         finally:
             wav_file = Path(wav_path)
