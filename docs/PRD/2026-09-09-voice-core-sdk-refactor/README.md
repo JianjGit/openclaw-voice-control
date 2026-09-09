@@ -6,10 +6,10 @@
 
 ## 文档
 
-- [`01-functional-prd.md`](./01-functional-prd.md)：功能 PRD、范围、兼容性、验收标准。
-- [`02-backend-design.md`](./02-backend-design.md)：模块拆分、运行时控制、事件流、线程模型和迁移方案。
-- [`03-public-api.md`](./03-public-api.md)：拟公开的 Python API、事件协议、Presenter 接口和使用约定。
-- [`04-backend-development-plan.md`](./04-backend-development-plan.md)：后端实施顺序、阶段目标、文件改动、测试要求、风险和 Definition of Done。
+- [`functional-design.md`](./functional-design.md)：功能设计、范围、兼容性与验收标准。
+- [`backend-design.md`](./backend-design.md)：模块拆分、运行时控制、事件流、线程模型和迁移方案。
+- [`backend-dev-plan.md`](./backend-dev-plan.md)：后端实施任务、测试编号、推荐顺序和完成定义。
+- [`api-design.md`](./api-design.md)：拟公开的 Python API、事件协议、Presenter 接口和使用约定。
 
 ## 核心原则
 
