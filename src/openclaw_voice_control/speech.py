@@ -23,10 +23,14 @@ class SpeechBackend(Protocol):
         ...
 
 
+CompletionCallback = Callable[[bool, BaseException | None], None]
+
+
 @dataclass(slots=True)
 class _SpeechItem:
     text: str
     metadata: Mapping[str, Any]
+    on_complete: CompletionCallback | None = None
     completion: threading.Event = field(default_factory=threading.Event)
     success: bool | None = None
     error: BaseException | None = None
@@ -82,13 +86,18 @@ class SpeechController:
         *,
         metadata: Mapping[str, Any] | None = None,
         clean_markdown: bool = True,
+        on_complete: CompletionCallback | None = None,
     ) -> _SpeechItem | None:
         speak_text = clean_text_for_tts(text) if clean_markdown else text
         speak_text = speak_text.strip()
         if not speak_text:
             return None
 
-        item = _SpeechItem(text=speak_text, metadata=dict(metadata or {}))
+        item = _SpeechItem(
+            text=speak_text,
+            metadata=dict(metadata or {}),
+            on_complete=on_complete,
+        )
         with self._pending_condition:
             self._pending += 1
         try:
@@ -241,6 +250,11 @@ class SpeechController:
             return
         item.success = success
         item.error = error
+        if item.on_complete is not None:
+            try:
+                item.on_complete(success, error)
+            except Exception:
+                self.logger.exception("Speech completion callback failed")
         item.completion.set()
         with self._pending_condition:
             self._pending -= 1
