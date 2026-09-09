@@ -18,7 +18,6 @@ class AppConfig:
     platform: str
     base_dir: Path
     log_dir: Path
-    runtime_dir: Path
     log_level: str
 
 
@@ -28,11 +27,16 @@ class OpenClawConfig:
     ws_url: str
     token: str
     agent_id: str
-    model: str
-    user: str
     session_key: str
+    home_dir: Path
     timeout_seconds: int = 120
     ws_timeout: int = 30
+
+
+@dataclass(slots=True)
+class STTConfig:
+    host: str = "127.0.0.1"
+    port: int = 15900
 
 
 @dataclass(slots=True)
@@ -77,14 +81,6 @@ class TTSConfig:
 
 
 @dataclass(slots=True)
-class OverlayConfig:
-    enabled: bool
-    state_file: Path
-    stop_flag_file: Path
-    poll_interval_ms: int
-
-
-@dataclass(slots=True)
 class ASRConfig:
     provider: str
     model: str
@@ -104,7 +100,7 @@ class VoiceControlConfig:
     audio: AudioConfig
     wakeword: WakewordConfig
     tts: TTSConfig
-    overlay: OverlayConfig
+    stt: STTConfig
     asr: ASRConfig
 
 
@@ -142,22 +138,14 @@ def _resolve_path(base_dir: Path, value: str) -> Path:
     return (base_dir / path).resolve()
 
 
-def _resolve_optional_path(base_dir: Path, value: str | None) -> Path | None:
-    if not value:
-        return None
-    return _resolve_path(base_dir, value)
-
-
 def _env_or_config(env_key: str, configured_value: Any, default: str) -> str:
     env_value = os.getenv(env_key)
     if env_value:
         return env_value
-
     if isinstance(configured_value, str):
         stripped = configured_value.strip()
         if stripped and stripped != f"${{{env_key}}}":
             return stripped
-
     return default
 
 
@@ -165,12 +153,10 @@ def _env_or_path(env_key: str, base_dir: Path, configured_value: Any, default: s
     env_value = os.getenv(env_key)
     if env_value:
         return _resolve_path(base_dir, env_value)
-
     if isinstance(configured_value, str):
         stripped = configured_value.strip()
         if stripped and stripped != f"${{{env_key}}}":
             return _resolve_path(base_dir, stripped)
-
     return _resolve_path(base_dir, default)
 
 
@@ -178,12 +164,10 @@ def _env_or_optional_path(env_key: str, base_dir: Path, configured_value: Any) -
     env_value = os.getenv(env_key)
     if env_value:
         return _resolve_path(base_dir, env_value)
-
     if isinstance(configured_value, str):
         stripped = configured_value.strip()
         if stripped and stripped != f"${{{env_key}}}":
             return _resolve_path(base_dir, stripped)
-
     return None
 
 
@@ -191,11 +175,18 @@ def _float_env_or_config(env_key: str, configured_value: Any, default: float) ->
     env_value = os.getenv(env_key)
     if env_value:
         return float(env_value)
-
     if configured_value is not None:
         return float(configured_value)
-
     return float(default)
+
+
+def _int_env_or_config(env_key: str, configured_value: Any, default: int) -> int:
+    env_value = os.getenv(env_key)
+    if env_value:
+        return int(env_value)
+    if configured_value is not None and configured_value != f"${{{env_key}}}":
+        return int(configured_value)
+    return int(default)
 
 
 def default_config_path() -> Path:
@@ -215,22 +206,20 @@ def load_config(config_path: str | Path | None = None, env_path: str | Path | No
 
     app = data.get("app", {})
     openclaw = data.get("openclaw", {})
+    stt = data.get("stt", {})
     audio = data.get("audio", {})
     wakeword = data.get("wakeword", {})
     tts = data.get("tts", {})
-    overlay = data.get("overlay", {})
     asr = data.get("asr", {})
 
     app_cfg = AppConfig(
         name=app.get("name", "openclaw-voice-control"),
-        platform=app.get("platform", "macos"),
+        platform=app.get("platform", "windows"),
         base_dir=base_dir,
         log_dir=_resolve_path(base_dir, app.get("log_dir", "logs")),
-        runtime_dir=_resolve_path(base_dir, app.get("runtime_dir", "runtime")),
         log_level=app.get("log_level", "INFO").upper(),
     )
 
-    # Resolve base URL (strip old /v1/chat/completions suffix if present)
     raw_base_url = _env_or_config(
         "OPENCLAW_BASE_URL",
         openclaw.get("base_url"),
@@ -239,7 +228,10 @@ def load_config(config_path: str | Path | None = None, env_path: str | Path | No
     base_url_clean = raw_base_url.rstrip("/")
     if base_url_clean.endswith("/v1/chat/completions"):
         base_url_clean = base_url_clean[: -len("/v1/chat/completions")]
-    ws_url = base_url_clean.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
+    configured_ws_url = _env_or_config("OPENCLAW_WS_URL", openclaw.get("ws_url"), "")
+    ws_url = configured_ws_url or (
+        base_url_clean.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
+    )
 
     return VoiceControlConfig(
         app=app_cfg,
@@ -248,11 +240,31 @@ def load_config(config_path: str | Path | None = None, env_path: str | Path | No
             ws_url=ws_url,
             token=os.getenv("OPENCLAW_TOKEN", openclaw.get("token", "")),
             agent_id=_env_or_config("OPENCLAW_AGENT_ID", openclaw.get("agent_id"), "main"),
-            model=_env_or_config("OPENCLAW_MODEL", openclaw.get("model"), "openclaw:main"),
-            user=_env_or_config("OPENCLAW_USER", openclaw.get("user"), "openclaw-voice-control"),
-            session_key=_env_or_config("OPENCLAW_SESSION_KEY", openclaw.get("session_key"), "agent:main:main"),
-            timeout_seconds=int(openclaw.get("timeout_seconds", 120)),
-            ws_timeout=int(openclaw.get("ws_timeout", 30)),
+            session_key=_env_or_config(
+                "OPENCLAW_SESSION_KEY",
+                openclaw.get("session_key"),
+                "agent:main:main",
+            ),
+            home_dir=_env_or_path(
+                "OPENCLAW_HOME",
+                base_dir,
+                openclaw.get("home_dir"),
+                "~/.openclaw",
+            ),
+            timeout_seconds=_int_env_or_config(
+                "OPENCLAW_TIMEOUT_SECONDS",
+                openclaw.get("timeout_seconds"),
+                120,
+            ),
+            ws_timeout=_int_env_or_config(
+                "OPENCLAW_WS_TIMEOUT",
+                openclaw.get("ws_timeout"),
+                30,
+            ),
+        ),
+        stt=STTConfig(
+            host=_env_or_config("STT_HOST", stt.get("host"), "127.0.0.1"),
+            port=_int_env_or_config("STT_PORT", stt.get("port"), 15900),
         ),
         audio=AudioConfig(
             sample_rate=int(audio.get("sample_rate", 16000)),
@@ -301,19 +313,13 @@ def load_config(config_path: str | Path | None = None, env_path: str | Path | No
             engine=tts.get("engine", "windows_sapi5"),
             voice=tts.get("voice", "Tingting"),
             wake_ack=tts.get("wake_ack", "我在"),
-            followup_beep_enabled=bool(tts.get("followup_beep_enabled", True)),
-            followup_beep_sound=tts.get("followup_beep_sound", "/System/Library/Sounds/Glass.aiff"),
-            record_done_beep_enabled=bool(tts.get("record_done_beep_enabled", True)),
-            record_done_sound=tts.get("record_done_sound", "/System/Library/Sounds/Funk.aiff"),
-            no_speech_beep_enabled=bool(tts.get("no_speech_beep_enabled", True)),
-            no_speech_sound=tts.get("no_speech_sound", "/System/Library/Sounds/Pop.aiff"),
-            post_reply_delay=float(tts.get("post_reply_delay", 0.05)),
-        ),
-        overlay=OverlayConfig(
-            enabled=bool(overlay.get("enabled", True)),
-            state_file=_resolve_path(base_dir, overlay.get("state_file", "runtime/overlay_state.json")),
-            stop_flag_file=_resolve_path(base_dir, overlay.get("stop_flag_file", "runtime/stop_tts.flag")),
-            poll_interval_ms=int(overlay.get("poll_interval_ms", 150)),
+            followup_beep_enabled=bool(tts.get("followup_beep_enabled", False)),
+            followup_beep_sound=tts.get("followup_beep_sound", ""),
+            record_done_beep_enabled=bool(tts.get("record_done_beep_enabled", False)),
+            record_done_sound=tts.get("record_done_sound", ""),
+            no_speech_beep_enabled=bool(tts.get("no_speech_beep_enabled", False)),
+            no_speech_sound=tts.get("no_speech_sound", ""),
+            post_reply_delay=float(tts.get("post_reply_delay", 0.0)),
         ),
         asr=ASRConfig(
             provider=asr.get("provider", "funasr"),
