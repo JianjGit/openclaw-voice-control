@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+from openclaw_voice_control.gateway_ws import GatewayWebSocket, ResponseAccumulator
+
+
+def _config(**overrides):
+    values = {
+        "ws_url": "ws://127.0.0.1:18789/ws",
+        "token": "token",
+        "session_key": "agent:main:main",
+        "agent_id": "main",
+        "ws_timeout": 7,
+        "timeout_seconds": 19,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_be_t08_response_accumulator_dedupes_ws_and_session_snapshots() -> None:
+    accumulator = ResponseAccumulator()
+
+    assert accumulator.feed_snapshot("第一句。") == ["第一句。"]
+    assert accumulator.feed_snapshot("第一句。") == []
+    assert accumulator.feed_snapshot("第一句。第二句。") == ["第二句。"]
+    assert accumulator.feed_snapshot("第一句。第二句。") == []
+    assert accumulator.full_text == "第一句。第二句。"
+
+
+def test_be_t08_accumulator_flushes_only_unspoken_tail() -> None:
+    accumulator = ResponseAccumulator()
+
+    assert accumulator.feed_snapshot("一句。未完成") == ["一句。"]
+    assert accumulator.feed_snapshot("一句。未完成尾巴") == []
+    assert accumulator.flush() == "未完成尾巴"
+    assert accumulator.flush() == ""
+
+
+def test_be_t08_session_fallback_reads_current_assistant_message(tmp_path) -> None:
+    session_dir = tmp_path / "agents" / "main" / "sessions"
+    session_dir.mkdir(parents=True)
+    now = datetime.now(timezone.utc)
+    session = session_dir / "session.jsonl"
+    session.write_text(
+        "\n".join(
+            [
+                json.dumps({"timestamp": now.isoformat(), "message": {"role": "user", "content": "🎤 hello"}}, ensure_ascii=False),
+                json.dumps({"timestamp": now.isoformat(), "message": {"role": "assistant", "content": [{"type": "text", "text": "fallback reply。"}]}}, ensure_ascii=False),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    gateway = GatewayWebSocket(_config())
+
+    snapshot = gateway._read_session_snapshot(
+        session_dir,
+        send_timestamp=now.timestamp(),
+        tagged="🎤",
+    )
+
+    assert snapshot == "fallback reply。"
+
+
+def test_be_t08_ack_wait_preserves_agent_event_order() -> None:
+    class FakeWS:
+        def __init__(self) -> None:
+            self.messages = [
+                json.dumps({"type": "event", "event": "agent", "payload": {"runId": "r1", "data": {"output": "早到事件。"}}}),
+                json.dumps({"type": "res", "id": "1", "ok": True}),
+            ]
+
+        async def recv(self):
+            return self.messages.pop(0)
+
+    gateway = GatewayWebSocket(_config())
+    gateway._ws = FakeWS()
+    response = asyncio.run(gateway._recv_response_async(1, timeout=1.0))
+
+    assert response is not None and response["ok"] is True
+    assert len(gateway._pending_events) == 1
+    assert gateway._pending_events[0]["event"] == "agent"
+
+
+def test_be_t08_session_root_uses_openclaw_home(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("OPENCLAW_HOME", str(tmp_path))
+    gateway = GatewayWebSocket(_config())
+    assert gateway._session_dir() == tmp_path / "agents" / "main" / "sessions"
+
+
+def test_be_t08_close_closes_ws_and_event_loop() -> None:
+    class FakeWS:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    gateway = GatewayWebSocket(_config())
+    loop = asyncio.new_event_loop()
+    ws = FakeWS()
+    gateway._loop = loop
+    gateway._ws = ws
+    gateway._connected = True
+
+    gateway.close()
+
+    assert ws.closed is True
+    assert loop.is_closed()
+    assert gateway._loop is None
+    assert gateway._ws is None
+    assert gateway._connected is False
+
+
+def test_be_t08_gateway_source_has_configured_timeouts_ordered_callbacks_and_local_proxy_policy() -> None:
+    source = inspect.getsource(GatewayWebSocket)
+    method = inspect.getsource(GatewayWebSocket._chat_send_streaming_async)
+
+    assert "self.config.ws_timeout" in source
+    assert "self.config.timeout_seconds" in source
+    assert method.index("send_timestamp = time.time()") < method.index("await self._send_async")
+    assert "threading.Thread" not in source
+    assert "os.environ.pop" not in source
+    assert "proxy=None" in source
+    assert "E:\\AppData" not in source
