@@ -7,7 +7,7 @@
 - [x] BE-03 SpeechController 与 Windows TTS 重构 — `BE-T03` fake backend 语义测试通过，提交 `6cfef1f`；Windows SAPI 真机验证留待 BE-12。
 - [x] BE-04 统一 ASR 与 STT HTTP 调用链 — `BE-T04` 并发锁与 HTTP 契约测试通过，提交 `78d4bdd`。
 - [x] BE-05 统一 OpenClaw 文本对话入口 — `BE-T05` 事件顺序、speak=false、错误与 turn lock 测试通过，提交 `c06f740`。
-- [ ] BE-06 外部主动朗读 API
+- [x] BE-06 外部主动朗读 API — `BE-T06` FIFO、单条 wait、stop 与 metadata 测试通过，提交 `4d070b4`。
 - [ ] BE-07 VoiceControlService 主循环迁移
 - [ ] BE-08 Gateway WebSocket 与流式回复稳定化
 - [ ] BE-09 配置、依赖与公开导入面整理
