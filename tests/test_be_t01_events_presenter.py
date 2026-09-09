@@ -41,7 +41,6 @@ def _config(tmp_path):
         app=SimpleNamespace(log_dir=tmp_path / "logs", runtime_dir=tmp_path / "runtime", log_level="INFO"),
         openclaw=object(),
         tts=object(),
-        overlay=object(),
         asr=object(),
         wakeword=SimpleNamespace(provider="openwakeword"),
     )
@@ -52,7 +51,6 @@ def _stub_backends(monkeypatch) -> None:
     monkeypatch.setattr(service_module, "WindowsTTS", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(service_module, "FunASRSenseVoice", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(service_module, "build_wakeword_engine", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(service_module, "OverlayStateManager", lambda *_args, **_kwargs: object())
 
 
 def test_be_t01_event_kinds_are_stable() -> None:
