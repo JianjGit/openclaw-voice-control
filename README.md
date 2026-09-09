@@ -2,16 +2,32 @@
 
 Headless Windows voice core SDK and standalone voice service for OpenClaw.
 
-The repository owns voice capabilities only: wakeword detection, recording, ASR, the local STT HTTP endpoint, OpenClaw Gateway conversation, Windows SAPI speech, runtime stop/shutdown control, and a small event/Presenter integration API. It does **not** contain a desktop pet, Qt overlay, character artwork, bubbles, or other UI implementation.
+OpenClaw Voice Control turns a Windows machine into a reusable voice layer: it listens for a wakeword, records speech, transcribes with SenseVoice/FunASR, sends text to OpenClaw Gateway, streams the reply into Windows SAPI5 TTS, and exposes a small event/API surface for desktop pets or other external applications.
 
-## Platform and runtime
+> 中文说明：[`README.zh-CN.md`](README.zh-CN.md)
 
-- Windows is the supported runtime target.
-- Python 3.11+.
-- The default realtime TTS backend is Windows SAPI5.
-- FunASR SenseVoice is used for local ASR.
-- openWakeWord is the default wakeword provider; Porcupine remains optional.
-- OpenClaw conversation uses the Gateway WebSocket with session JSONL fallback.
+## Features
+
+- Wakeword detection with openWakeWord; optional Porcupine support.
+- Microphone recording with silence-based end detection.
+- Local SenseVoice / FunASR speech recognition.
+- Local `POST /stt` HTTP endpoint for file transcription.
+- OpenClaw Gateway conversation over WebSocket with session fallback.
+- Streaming sentence-by-sentence TTS through Windows SAPI5.
+- FIFO speech queue with stop / shutdown control.
+- Public Python SDK: text chat, file transcription, active speech, lifecycle control.
+- Framework-neutral `Presenter` + `VoiceEvent` integration for desktop pets and GUI apps.
+- Standalone Windows service mode.
+
+The core intentionally contains no desktop-pet UI, PySide6 overlay, character assets, bubbles, or animation logic.
+
+## Requirements
+
+- Windows
+- Python 3.11+
+- A reachable OpenClaw Gateway
+- Local SenseVoice model files
+- A microphone for standalone voice mode
 
 ## Install
 
@@ -23,9 +39,18 @@ pip install -e ".[dev]"
 copy .env.example .env
 ```
 
-Edit `.env` and at minimum configure the OpenClaw token and any local model paths you use. The default YAML is `config/default.yaml`.
+Edit `.env` and configure at least the OpenClaw token and the local ASR model paths you use. Default runtime settings live in [`config/default.yaml`](config/default.yaml).
 
-Start the standalone service:
+Optional routes:
+
+```powershell
+pip install -e ".[porcupine]"   # optional Porcupine wakeword provider
+pip install -e ".[tts-cli]"     # optional edge-tts/comtypes helpers for tts_cli.py
+```
+
+## Quick start
+
+### Run as a standalone voice service
 
 ```powershell
 .\run_service.bat
@@ -37,23 +62,39 @@ or:
 python -m openclaw_voice_control --config config/default.yaml --env-file .env
 ```
 
-## Public Python API
+The normal standalone flow is:
 
-```python
-from openclaw_voice_control import (
-    ConsolePresenter,
-    NullPresenter,
-    Presenter,
-    VoiceControlService,
-    VoiceEvent,
-    VoiceEventKind,
-)
-from openclaw_voice_control.config import load_config
-
-service = VoiceControlService(load_config(), presenter=NullPresenter())
+```text
+wakeword
+  -> recording
+  -> SenseVoice / FunASR
+  -> OpenClaw Gateway
+  -> streaming reply
+  -> SpeechController
+  -> Windows SAPI5
+  -> idle
 ```
 
-The stable service entry points are:
+### Use as a Python SDK
+
+```python
+from openclaw_voice_control import NullPresenter, VoiceControlService
+from openclaw_voice_control.config import load_config
+
+service = VoiceControlService(
+    load_config("config/default.yaml", ".env"),
+    presenter=NullPresenter(),
+)
+
+reply = service.ask_text("Hello", speak=True)
+print(reply)
+
+service.speak_message("Voice Core is ready.")
+service.stop_speaking()
+service.close()
+```
+
+Main public methods:
 
 ```python
 service.transcribe_file(path, metadata=None)          # -> str
@@ -64,11 +105,106 @@ service.run()                                         # blocking standalone loop
 service.close()                                       # idempotent shutdown
 ```
 
-`transcribe_file()` uses the same serialized ASR path as the STT HTTP server. `ask_text(..., speak=True)` streams complete sentences into the speech queue; `speak=False` returns text without TTS. `speak_message()` is independent of OpenClaw, ASR, wakeword, and recording.
+For desktop pets and other GUI applications, see [`docs/desktop-pet-integration.md`](docs/desktop-pet-integration.md).
 
-## Events and Presenter integration
+## Architecture at a glance
 
-The event protocol contains these stable values:
+Main technologies:
+
+- **Wakeword:** openWakeWord, optional Porcupine
+- **Audio:** `sounddevice` + NumPy
+- **ASR:** FunASR + SenseVoice
+- **Conversation:** OpenClaw Gateway WebSocket + session JSONL fallback
+- **TTS:** Windows SAPI5
+- **Concurrency:** Python threads, locks, queues and runtime events
+- **Integration:** framework-neutral `VoiceEvent` / `Presenter`
+
+High-level structure:
+
+```text
+External App / Desktop Pet
+        │ API calls
+        │ VoiceEvent / Presenter
+        ▼
+VoiceControlService
+  ├─ Wakeword + Recording
+  ├─ FunASR / SenseVoice
+  ├─ STT HTTP Server
+  ├─ OpenClaw Gateway Client
+  ├─ SpeechController
+  └─ Windows SAPI5
+```
+
+The standalone loop and SDK share the same ASR, Gateway and speech components, so GUI consumers do not need a separate voice implementation.
+
+More details: [`docs/architecture.md`](docs/architecture.md).
+
+## Repository layout
+
+```text
+openclaw-voice-control/
+├─ config/       # default runtime configuration
+├─ docs/         # architecture, module notes, integration and validation docs
+├─ examples/     # small external-consumer examples
+├─ scripts/      # TTS/STT/audio diagnostic utilities
+├─ skills/       # OpenClaw skill documentation
+├─ src/          # Python package: openclaw_voice_control
+├─ tests/        # automated BE-T01..BE-T12 tests
+├─ .github/      # GitHub Actions workflow
+├─ .env.example  # environment variable template
+├─ pyproject.toml
+└─ run_service.bat
+```
+
+## Documentation map
+
+```text
+docs/
+├─ architecture.md
+│  └─ overall runtime, ownership, threads and lifecycle
+│
+├─ desktop-pet-integration.md
+│  └─ how desktop pets / external GUI apps consume Voice Core APIs and events
+│
+├─ modules/
+│  ├─ cli-and-config.md    # configuration and startup
+│  ├─ main-loop.md         # standalone wakeword loop
+│  ├─ wakeword.md          # wakeword providers and lifecycle
+│  ├─ record.md            # microphone recording and silence detection
+│  ├─ asr.md               # SenseVoice / FunASR
+│  ├─ gateway-ws.md        # OpenClaw WebSocket and response aggregation
+│  ├─ tts.md               # Windows TTS and SpeechController
+│  └─ events-and-text.md   # VoiceEvent protocol and text cleanup
+│
+├─ same-machine-test.md
+│  └─ real Windows microphone / ASR / wakeword / SAPI / Gateway validation
+│
+├─ fresh-clone-validation.md
+│  └─ clean-machine installation validation
+│
+├─ release-checklist.md
+│  └─ pre-release checks
+│
+└─ PRD/2026-09-09-voice-core-sdk-refactor/
+   ├─ functional-design.md # expected product behavior
+   ├─ backend-design.md    # backend architecture and responsibilities
+   ├─ api-design.md        # detailed public API contract
+   └─ backend-dev-plan.md  # BE-01..BE-12 implementation record
+```
+
+If you need to answer “which API should a desktop pet call?”, start with [`docs/desktop-pet-integration.md`](docs/desktop-pet-integration.md). If you need exact API semantics, continue to the PRD API design.
+
+## Presenter events
+
+External applications can implement a simple Presenter:
+
+```python
+class MyPresenter:
+    def emit(self, event):
+        ui_queue.put(event)
+```
+
+Stable event kinds:
 
 ```text
 listening
@@ -80,109 +216,25 @@ idle
 error
 ```
 
-Implement a Presenter to bridge Voice Core into another application:
+`Presenter.emit()` may be called from the service thread or the speech worker, so GUI applications must marshal events back onto their own UI thread.
 
-```python
-class MyPresenter:
-    def emit(self, event):
-        ui_queue.put(event)
+A minimal working bridge is available at [`examples/external_presenter.py`](examples/external_presenter.py).
+
+## Utilities
+
+- [`scripts/tts_cli.py`](scripts/tts_cli.py) — SAPI5 / optional edge-tts file synthesis helper.
+- [`scripts/stt_endpoint_client.py`](scripts/stt_endpoint_client.py) — client for the local `/stt` endpoint.
+- [`scripts/list_audio_devices.py`](scripts/list_audio_devices.py) — list audio devices.
+- [`scripts/test_microphone.py`](scripts/test_microphone.py) — microphone capture diagnostic.
+
+See [`scripts/README.md`](scripts/README.md) for details.
+
+## Tests
+
+```powershell
+python -m pytest -q
 ```
 
-`Presenter.emit()` may be called from the service thread or the speech worker. A GUI integration must marshal events onto its own UI thread. Presenter exceptions are isolated by the core service.
+The automated suite covers events, runtime control, speech queue semantics, ASR serialization, STT HTTP, text conversation, active speech, standalone orchestration, Gateway aggregation/deduplication, configuration, cleanup regressions and external Presenter/API integration.
 
-See `examples/external_presenter.py` for a minimal queue-based integration.
-
-## Typical event flows
-
-Text conversation with speech:
-
-```text
-thinking -> speaking (0..N) -> reply -> idle
-```
-
-Text conversation without speech:
-
-```text
-thinking -> reply -> idle
-```
-
-External active speech:
-
-```text
-speaking -> idle
-```
-
-Recoverable standalone errors emit `error` followed by `idle` at the appropriate orchestration boundary.
-
-## STT HTTP endpoint
-
-The standalone service exposes:
-
-```text
-POST http://127.0.0.1:15900/stt
-Content-Type: application/json
-
-{"path": "C:/audio/input.wav"}
-```
-
-Successful response:
-
-```json
-{"text": "recognized text"}
-```
-
-Host and port are configurable through `STT_HOST` / `STT_PORT` or YAML. `scripts/stt_endpoint_client.py` uses the same defaults and accepts CLI overrides.
-
-## Configuration
-
-Important environment variables:
-
-```text
-OPENCLAW_BASE_URL
-OPENCLAW_WS_URL
-OPENCLAW_TOKEN
-OPENCLAW_AGENT_ID
-OPENCLAW_SESSION_KEY
-OPENCLAW_HOME
-OPENCLAW_TIMEOUT_SECONDS
-OPENCLAW_WS_TIMEOUT
-STT_HOST
-STT_PORT
-WAKEWORD_PROVIDER
-OPENWAKEWORD_MODEL_NAME
-OPENWAKEWORD_MODEL_PATH
-OPENWAKEWORD_THRESHOLD
-PICOVOICE_ACCESS_KEY
-WAKEWORD_FILE
-SENSEVOICE_MODEL_PATH
-SENSEVOICE_VAD_MODEL_PATH
-VOICE_CONTROL_CONFIG
-```
-
-See `.env.example` and `config/default.yaml` for the current defaults.
-
-## Utility scripts
-
-The supported helper scripts are:
-
-- `scripts/tts_cli.py` — offline SAPI5 / optional edge-tts file synthesis helper.
-- `scripts/stt_endpoint_client.py` — thin client for the local `/stt` endpoint.
-- `scripts/list_audio_devices.py` — enumerate audio devices.
-- `scripts/test_microphone.py` — microphone capture diagnostic.
-
-Legacy Overlay, launchd, macOS deploy/install/restart scripts, and the old silent TTS stub are intentionally removed.
-
-## Tests and CI
-
-Hardware-free tests live in `tests/` and cover the event protocol, runtime control, speech queue semantics, ASR serialization, STT HTTP, text conversation, external speech, standalone orchestration, Gateway aggregation/deduplication, configuration, repository cleanup, text normalization, and external Presenter/API integration.
-
-`.github/workflows/ci.yml` is configured for `windows-latest` with Python 3.11 and runs package installation, `compileall`, and `pytest`. Real microphone, SenseVoice model execution, openWakeWord, Windows SAPI voice output, and a live OpenClaw Gateway remain explicit machine-level integration checks rather than deterministic unit tests.
-
-## Architecture and design
-
-- Current architecture: `docs/architecture.md`
-- Module notes: `docs/modules/`
-- Refactor design and implementation record: `docs/PRD/2026-09-09-voice-core-sdk-refactor/`
-- External integration example: `examples/external_presenter.py`
-
-Capabilities intentionally outside this repository include desktop-pet UI, character assets, animation/state mapping, follow-up conversation loops, and proactive OpenClaw push listening unless a later design explicitly adds them.
+Hardware-dependent validation is documented separately in [`docs/same-machine-test.md`](docs/same-machine-test.md).
