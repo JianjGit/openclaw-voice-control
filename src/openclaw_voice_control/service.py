@@ -43,6 +43,8 @@ class VoiceControlService:
         self.asr = FunASRSenseVoice(config.asr)
         self._asr_lock = threading.Lock()
         self._turn_lock = threading.Lock()
+        self._speak_message_lock = threading.Lock()
+        self._speak_message_generation = 0
         self.stt_server = STTServer(self.transcribe_file, logger=self.logger)
         self.wakeword = build_wakeword_engine(config.wakeword)
         self.state = OverlayStateManager(config.overlay)
@@ -173,6 +175,52 @@ class VoiceControlService:
                 self.speech.wait_done()
             self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
             return reply
+
+    def speak_message(
+        self,
+        text: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        wait: bool = False,
+    ) -> None:
+        speak_text = text.strip()
+        if not speak_text:
+            raise ValueError("text must not be empty")
+
+        event_metadata = dict(metadata or {})
+        self.speech.clear_stop_request()
+        with self._speak_message_lock:
+            self._speak_message_generation += 1
+            generation = self._speak_message_generation
+        item = self.speech.enqueue(speak_text, metadata=event_metadata)
+        if item is None:
+            self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+            return
+
+        if wait:
+            self.speech.wait_done()
+            with self._speak_message_lock:
+                if generation == self._speak_message_generation:
+                    self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+            return
+
+        def emit_idle_when_queue_drains() -> None:
+            self.speech.wait_done()
+            with self._speak_message_lock:
+                if generation != self._speak_message_generation:
+                    return
+                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+
+        threading.Thread(
+            target=emit_idle_when_queue_drains,
+            name="openclaw-speak-message-idle",
+            daemon=True,
+        ).start()
+
+    def stop_speaking(self) -> None:
+        with self._speak_message_lock:
+            self._speak_message_generation += 1
+        self.speech.stop(emit_idle=True)
 
     def update_overlay_state(
         self,
