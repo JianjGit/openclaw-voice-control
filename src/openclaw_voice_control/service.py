@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import numpy as np
-import requests
 import sounddevice as sd
 
 from .asr import FunASRSenseVoice
@@ -21,9 +20,7 @@ from .openclaw_client import OpenClawClient
 from .presenter import NullPresenter, Presenter
 from .runtime import RuntimeControl
 from .speech import SpeechController
-from .state import OverlayStateManager
 from .stt_server import STTServer
-from .text import clean_text_for_overlay
 from .tts import WindowsTTS
 from .wakeword import build_wakeword_engine
 
@@ -47,7 +44,6 @@ class VoiceControlService:
         self._closed = False
         self.stt_server = STTServer(self.transcribe_file, logger=self.logger)
         self.wakeword = build_wakeword_engine(config.wakeword)
-        self.state = OverlayStateManager(config.overlay)
 
     def _start_wakeword_engine(self) -> None:
         self.logger.info("Initializing wakeword engine...")
@@ -66,18 +62,6 @@ class VoiceControlService:
                 self.config.wakeword.provider,
                 self.config.wakeword.keyword_path,
             )
-
-    def _restart_wakeword_engine(self) -> None:
-        try:
-            self.wakeword.close()
-        except Exception:
-            self.logger.exception("Failed to close wakeword engine before restart")
-        self._start_wakeword_engine()
-
-    def _return_to_idle(self, auto_hide_ms: int = 200, clear_stop_flag: bool = False) -> None:
-        self.update_overlay_state("idle", auto_hide_ms=auto_hide_ms)
-        if clear_stop_flag:
-            self.speech.clear_stop_request()
 
     def _build_logger(self) -> logging.Logger:
         logger = logging.getLogger("openclaw.voice_control")
@@ -157,7 +141,12 @@ class VoiceControlService:
                         kind=VoiceEventKind.ERROR,
                         text=str(exc),
                         user_text=user_text,
-                        metadata={**event_metadata, "stage": "gateway"},
+                        metadata={
+                            **event_metadata,
+                            "stage": "gateway",
+                            "exception_type": type(exc).__name__,
+                            "recoverable": True,
+                        },
                     )
                 )
                 self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
@@ -230,22 +219,6 @@ class VoiceControlService:
             self.logger.exception("Failed to close wakeword engine")
         self.client.close()
 
-    def update_overlay_state(
-        self,
-        status: str,
-        user_text: str = "",
-        reply_text: str = "",
-        meta_text: str = "",
-        auto_hide_ms: int = 4000,
-    ) -> None:
-        self.state.write(
-            status=status,
-            user_text=user_text,
-            reply_text=reply_text,
-            meta_text=meta_text,
-            auto_hide_ms=auto_hide_ms,
-        )
-
     @staticmethod
     def rms_level(audio_chunk: np.ndarray) -> float:
         chunk = audio_chunk.astype("float32")
@@ -267,7 +240,13 @@ class VoiceControlService:
     def record_until_silence(self, prepared_stream: sd.InputStream | None = None) -> Optional[str]:
         audio = self.config.audio
         self.logger.info("Start listening")
-        self.update_overlay_state("listening", meta_text="请开始说话", auto_hide_ms=0)
+        self._emit(
+            VoiceEvent(
+                kind=VoiceEventKind.LISTENING,
+                text="请开始说话",
+                metadata={"source": "wakeword"},
+            )
+        )
 
         frames: list[np.ndarray] = []
         pending_frames: list[np.ndarray] = []
@@ -283,10 +262,12 @@ class VoiceControlService:
         stream = prepared_stream or self._build_record_stream(block_size)
 
         try:
-            stream.start()
+            # A prepared stream is explicitly already started by the wakeword handoff caller.
+            if prepared_stream is None:
+                stream.start()
             while total_time < audio.max_record_seconds:
                 if self.speech.is_stop_requested():
-                    self.update_overlay_state("idle", auto_hide_ms=120)
+                    self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "recording"}))
                     return None
 
                 data, _ = stream.read(block_size)
@@ -304,9 +285,20 @@ class VoiceControlService:
                         start_hit_count = 0
                         wait_for_start_time += block_duration
                         if wait_for_start_time >= audio.start_timeout_seconds:
-                            self.update_overlay_state("no_speech", meta_text="没有检测到有效语音", auto_hide_ms=2200)
+                            self._emit(
+                                VoiceEvent(
+                                    kind=VoiceEventKind.ERROR,
+                                    text="没有检测到有效语音",
+                                    metadata={
+                                        "source": "wakeword",
+                                        "stage": "recording",
+                                        "recoverable": True,
+                                    },
+                                )
+                            )
                             if self.config.tts.no_speech_beep_enabled:
                                 self.speech.play_sound_async(self.config.tts.no_speech_sound)
+                            self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "wakeword"}))
                             return None
 
                     if start_hit_count >= audio.start_hits_required:
@@ -326,9 +318,20 @@ class VoiceControlService:
                             break
 
             if not speech_started or speech_time < audio.min_speech_seconds:
-                self.update_overlay_state("no_speech", meta_text="没有检测到有效语音", auto_hide_ms=2200)
+                self._emit(
+                    VoiceEvent(
+                        kind=VoiceEventKind.ERROR,
+                        text="没有检测到有效语音",
+                        metadata={
+                            "source": "wakeword",
+                            "stage": "recording",
+                            "recoverable": True,
+                        },
+                    )
+                )
                 if self.config.tts.no_speech_beep_enabled:
                     self.speech.play_sound_async(self.config.tts.no_speech_sound)
+                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "wakeword"}))
                 return None
 
             fd, path = tempfile.mkstemp(suffix=".wav")
@@ -352,33 +355,55 @@ class VoiceControlService:
                 self.logger.exception("Failed to close input stream")
 
     def handle_one_turn(self, wav_path: str) -> bool:
+        event_metadata = {"source": "wakeword"}
         try:
-            user_text = self.transcribe_file(wav_path)
-            self.logger.info("ASR: %s", user_text[:100] if user_text else "(empty)")
-            if not user_text:
-                self.update_overlay_state("no_speech", meta_text="没有识别出有效文本", auto_hide_ms=2200)
+            try:
+                user_text = self.transcribe_file(wav_path)
+            except Exception as exc:
+                self.logger.exception("ASR failed during recorded turn")
+                self._emit(
+                    VoiceEvent(
+                        kind=VoiceEventKind.ERROR,
+                        text=str(exc),
+                        metadata={
+                            **event_metadata,
+                            "stage": "asr",
+                            "exception_type": type(exc).__name__,
+                            "recoverable": True,
+                        },
+                    )
+                )
+                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
                 return False
 
-            self.update_overlay_state("recognized", user_text=user_text, meta_text="识别完成", auto_hide_ms=1800)
-            self.update_overlay_state("thinking", user_text=user_text, meta_text="正在思考", auto_hide_ms=0)
-            reply = self.ask_text(user_text, speak=True)
+            self.logger.info("ASR: %s", user_text[:100] if user_text else "(empty)")
+            if not user_text:
+                self._emit(
+                    VoiceEvent(
+                        kind=VoiceEventKind.ERROR,
+                        text="没有识别出有效文本",
+                        metadata={**event_metadata, "stage": "asr", "recoverable": True},
+                    )
+                )
+                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+                return False
+
+            self._emit(
+                VoiceEvent(
+                    kind=VoiceEventKind.RECOGNIZED,
+                    text=user_text,
+                    user_text=user_text,
+                    metadata=event_metadata,
+                )
+            )
+            try:
+                reply = self.ask_text(user_text, speak=True, metadata=event_metadata)
+            except Exception:
+                # ask_text emits gateway error -> idle and preserves the exception for SDK callers.
+                self.logger.exception("OpenClaw turn failed")
+                return False
             self.logger.info("Reply: %s", reply[:100] if reply else "(empty)")
-            reply_clean = clean_text_for_overlay(reply)
-            self.update_overlay_state("reply", user_text=user_text, reply_text=reply_clean, meta_text="Jarvis", auto_hide_ms=0)
-            if reply:
-                time.sleep(self.config.tts.post_reply_delay)
-            self.update_overlay_state("idle", auto_hide_ms=120)
             return True
-        except requests.HTTPError:
-            self.logger.exception("OpenClaw request failed")
-            self.update_overlay_state("no_speech", meta_text="请求失败", auto_hide_ms=2200)
-            self.speech.speak("请求失败。", clean_markdown=False)
-            return False
-        except Exception:
-            self.logger.exception("Unexpected error during turn handling")
-            self.update_overlay_state("no_speech", meta_text="出了点问题", auto_hide_ms=2200)
-            self.speech.speak("出了点问题。", clean_markdown=False)
-            return False
         finally:
             wav_file = Path(wav_path)
             if wav_file.exists():
@@ -418,8 +443,7 @@ class VoiceControlService:
         self.stt_server.start()
         self._start_wakeword_engine()
         self.speech.clear_stop_request()
-        self.state.ensure_idle_state(reset=True)
-        self.update_overlay_state("idle", auto_hide_ms=200)
+        self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "startup"}))
         self.logger.info("Entered idle listening loop")
 
         next_allowed_trigger_time = 0.0
@@ -429,7 +453,7 @@ class VoiceControlService:
             nonlocal next_allowed_trigger_time
             next_allowed_trigger_time = max(next_allowed_trigger_time, time.time() + seconds)
 
-        while True:
+        while not self.runtime.is_shutdown_requested():
             _, keyword_index = self.wakeword.read()
             if not wakeword_armed:
                 continue
@@ -443,12 +467,15 @@ class VoiceControlService:
             wakeword_armed = False
             self.logger.info("Wakeword detected")
 
-            self.update_overlay_state("wake", meta_text="已唤醒", auto_hide_ms=1800)
             self.speech.clear_stop_request()
-            wake_ok = self.speech.speak(self.config.tts.wake_ack, clean_markdown=False)
+            wake_ok = self.speech.speak(
+                self.config.tts.wake_ack,
+                metadata={"source": "wakeword_ack"},
+                clean_markdown=False,
+            )
             if not wake_ok or self.speech.is_stop_requested():
                 wakeword_armed = True
-                self.update_overlay_state("idle", auto_hide_ms=120)
+                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "wakeword"}))
                 self.speech.clear_stop_request()
                 continue
 
@@ -456,28 +483,39 @@ class VoiceControlService:
             prepared_stream = self._build_record_stream(block_size)
             wav_path: Optional[str] = None
             try:
-                self.wakeword.close()
+                self.wakeword.pause()
                 prepared_stream.start()
                 wav_path = self.record_until_silence(prepared_stream=prepared_stream)
-            except Exception:
+            except Exception as exc:
                 self.logger.exception("Failed to hand off from wakeword listening to recording")
                 try:
                     prepared_stream.stop()
                     prepared_stream.close()
                 except Exception:
                     self.logger.exception("Failed to close prepared recording stream after handoff failure")
-                self._start_wakeword_engine()
-                self.update_overlay_state("no_speech", meta_text="录音启动失败", auto_hide_ms=2200)
-                continue
+                self._emit(
+                    VoiceEvent(
+                        kind=VoiceEventKind.ERROR,
+                        text=str(exc),
+                        metadata={
+                            "source": "wakeword",
+                            "stage": "recording",
+                            "exception_type": type(exc).__name__,
+                            "recoverable": True,
+                        },
+                    )
+                )
+                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "wakeword"}))
+            finally:
+                if not self.runtime.is_shutdown_requested():
+                    self.wakeword.resume()
+
             if not wav_path:
                 extend_rearm(self.config.wakeword.rearm_seconds_after_turn)
                 wakeword_armed = True
-                self._start_wakeword_engine()
-                self._return_to_idle(auto_hide_ms=200, clear_stop_flag=True)
+                self.speech.clear_stop_request()
                 continue
 
             self.handle_one_turn(wav_path)
             extend_rearm(self.config.wakeword.rearm_seconds_after_turn)
             wakeword_armed = True
-            self._start_wakeword_engine()
-            self._return_to_idle(auto_hide_ms=120)
