@@ -1,26 +1,92 @@
 # Voice Input Modes and Main Loop
 
-`VoiceControlService` exposes two microphone-input modes that share the same recording, ASR, Gateway and TTS pipeline.
+`VoiceControlService.run()` 现在是一个常驻 Voice Core 生命周期。它负责加载并保留 ASR、STT HTTP、Gateway/TTS 相关对象，并根据当前 input mode 决定麦克风由 wakeword 还是 `listen_once()` 驱动。
 
-## `run()` — standalone wakeword mode
+## `run()` — 常驻 Voice Core
 
-`VoiceControlService.run()` is the blocking standalone lifecycle. Startup loads ASR, starts the local STT HTTP server, starts the wakeword engine, emits startup `idle`, and enters the wakeword loop.
+启动时：
 
-On wakeword detection the service:
+1. 加载 ASR；
+2. 启动本地 STT HTTP server；
+3. 根据当前 input mode 决定是否启动 wakeword 监听；
+4. 发 startup `idle`；
+5. 保持服务循环，直到 shutdown。
 
-1. clears any previous speech-stop request;
-2. speaks the wake acknowledgement through `SpeechController`;
-3. pauses the wakeword audio stream without discarding the loaded model;
-4. starts one prepared recording stream and hands it to `record_until_silence()`;
-5. resumes the wakeword stream after recording;
-6. calls `handle_one_turn()`, which composes `transcribe_file()` and `ask_text()`;
-7. rearms the wakeword path for the next independent turn.
+`run()` 不再用一把锁占住整个服务生命周期。输入锁只保护实际麦克风所有权，因此 `push_to_talk` 模式下 `run()` 可以继续常驻，而 `listen_once()` 获得输入锁执行一轮录音。
 
-The current default is one conversation turn per wake. There is no follow-up loop.
+## `set_input_mode()` — 运行时切换
 
-## `listen_once()` — push-to-talk mode
+```python
+service.set_input_mode("wakeword")
+service.set_input_mode("push_to_talk")
+```
 
-`VoiceControlService.listen_once()` runs one complete recorded turn immediately and does not wait for or start wakeword detection.
+模式：
+
+```text
+wakeword
+  -> wakeword engine listening
+
+push_to_talk
+  -> wakeword engine paused
+  -> run() remains alive
+  -> wait for listen_once()
+```
+
+切换不会重建：
+
+- `VoiceControlService`；
+- FunASR / SenseVoice；
+- SpeechController / Windows TTS；
+- OpenClaw Gateway client；
+- STT HTTP server。
+
+wakeword 从 `wakeword` 切到 `push_to_talk` 时只调用 `pause()`，保留已经加载的模型/engine；切回来调用 `resume()`。
+
+### 返回值
+
+```python
+applied = service.set_input_mode(mode)
+```
+
+- `True`：已经应用；
+- `False`：当前语音活动未结束，模式已进入 pending，结束后自动应用。
+
+可查询：
+
+```python
+service.get_input_mode()
+service.get_pending_input_mode()
+```
+
+完整说明见 [`../input-modes.md`](../input-modes.md)。
+
+## wakeword 模式流程
+
+wakeword 检测循环：
+
+1. wakeword stream 读取一帧；
+2. 命中唤醒词后，当前 turn 原子地标记为 active；
+3. `wakeword.pause()`，关闭 wakeword 麦克风但保留模型；
+4. 朗读 wake acknowledgement；
+5. 使用同一把输入锁切换到 recording stream；
+6. `record_until_silence()`；
+7. `handle_one_turn()` 组合 `transcribe_file()` 和 `ask_text()`；
+8. 等 ASR / Gateway / TTS 本轮全部结束；
+9. 如果模式仍是 `wakeword`，`wakeword.resume()`；
+10. 如果 pending 是 `push_to_talk`，保持 wakeword paused 并在本轮结束后应用模式。
+
+因此 wakeword 不会在当前回答仍朗读时被提前恢复。
+
+## `listen_once()` — push-to-talk 输入
+
+当常驻服务已经切到：
+
+```text
+push_to_talk
+```
+
+桌宠/bridge 可以调用：
 
 ```python
 ok = service.listen_once(
@@ -29,10 +95,11 @@ ok = service.listen_once(
 )
 ```
 
-Flow:
+流程：
 
 ```text
 listen_once()
+  -> acquire shared microphone input lock
   -> record_until_silence()
   -> transcribe_file()
   -> recognized
@@ -40,28 +107,53 @@ listen_once()
   -> streaming TTS when speak=True
   -> reply
   -> idle
+  -> release input lock
 ```
 
-The method returns `True` when the recorded turn completes successfully and `False` when no valid speech is recorded or the downstream recorded turn fails. Microphone-open failures emit `error(stage="recording") -> idle` and are re-raised to the caller.
-
-`metadata` is forwarded through the recorded-turn events. The default source is `listen_once`, and callers may override it, for example with `source="desktop_pet"`.
-
-## Input-mode exclusivity
-
-`run()` and `listen_once()` are alternative microphone-input modes. They must not run concurrently, and concurrent `listen_once()` calls are also rejected.
-
-The service uses an input-mode lock and raises:
+如果 `run()` 正在运行且当前仍为 `wakeword`，直接调用 `listen_once()` 会抛：
 
 ```python
-RuntimeError("voice input is already active")
+RuntimeError("listen_once requires push_to_talk input mode while run() is active")
 ```
 
-instead of allowing multiple recording/wakeword streams to compete for the microphone.
+这避免桌宠忘记切模式后又打开第二个 microphone stream。
 
-For a push-to-talk desktop application, create `VoiceControlService` but do not call `run()`; submit `listen_once()` to a background worker whenever the user presses the microphone button or hotkey.
+如果没有启动 `run()`，`listen_once()` 仍保留原先的一次性 SDK 使用方式。
 
-Business/UI state is expressed only through `VoiceEvent` and Presenter. Neither input mode writes Overlay JSON or TTS stop-flag files.
+## 模式切换安全边界
 
-Recoverable recording, ASR, or Gateway failures emit an `error` event and return to `idle` at the appropriate orchestration boundary. Fatal standalone startup/runtime exceptions are logged by `run()` and re-raised after crash-report handling.
+Voice Core 对 recording、ASR、Gateway conversation 和 speech activity 做活动计数。
 
-`RuntimeControl.request_shutdown()` terminates the standalone loop. `run()` always invokes the idempotent `close()` in `finally`.
+当这些活动存在时：
+
+```text
+set_input_mode(new_mode)
+  -> pending_input_mode = new_mode
+  -> return False
+  -> current turn continues normally
+  -> activity count reaches zero
+  -> apply pending mode
+```
+
+模式真正生效后会发：
+
+```text
+idle
+metadata.source = input_mode
+metadata.input_mode = wakeword | push_to_talk
+metadata.mode_change = applied
+```
+
+Presenter/bridge 可以利用这个事件确认 deferred switch 最终完成。
+
+## 单一麦克风锁
+
+wakeword read/turn 与 `listen_once()` 共用 `_input_mode_lock`。
+
+切到 `push_to_talk` 时，必须先获得这把锁并完成 `wakeword.pause()`，然后才把模式标记为已生效；切回 `wakeword` 时也要先确认 `listen_once()` 已释放同一把锁，再 resume wakeword。
+
+因此两条路径不会同时打开麦克风。
+
+## Shutdown
+
+`RuntimeControl.request_shutdown()` 终止常驻循环。`run()` 最终调用幂等 `close()`，此时才真正释放 wakeword model、SpeechController/TTS、STT server 和 Gateway client。
