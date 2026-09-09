@@ -39,6 +39,7 @@ class VoiceControlService:
         self.asr = FunASRSenseVoice(config.asr)
         self._asr_lock = threading.Lock()
         self._turn_lock = threading.Lock()
+        self._input_mode_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._closed = False
         self.stt_server = STTServer(
@@ -108,6 +109,48 @@ class VoiceControlService:
             raise FileNotFoundError(str(audio_path))
         with self._asr_lock:
             return self.asr.transcribe(str(audio_path))
+
+    def listen_once(
+        self,
+        *,
+        speak: bool = True,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Run one push-to-talk voice turn without waiting for a wakeword."""
+        if not self._input_mode_lock.acquire(blocking=False):
+            raise RuntimeError("voice input is already active")
+
+        event_metadata = {"source": "listen_once", **dict(metadata or {})}
+        try:
+            self.speech.clear_stop_request()
+            try:
+                wav_path = self.record_until_silence(metadata=event_metadata)
+            except Exception as exc:
+                self.logger.exception("Recording failed during listen_once")
+                self._emit(
+                    VoiceEvent(
+                        kind=VoiceEventKind.ERROR,
+                        text=str(exc),
+                        metadata={
+                            **event_metadata,
+                            "stage": "recording",
+                            "exception_type": type(exc).__name__,
+                            "recoverable": True,
+                        },
+                    )
+                )
+                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
+                raise
+
+            if not wav_path:
+                return False
+            return self.handle_one_turn(
+                wav_path,
+                speak=speak,
+                metadata=event_metadata,
+            )
+        finally:
+            self._input_mode_lock.release()
 
     def ask_text(
         self,
@@ -241,14 +284,20 @@ class VoiceControlService:
             blocksize=block_size,
         )
 
-    def record_until_silence(self, prepared_stream: sd.InputStream | None = None) -> Optional[str]:
+    def record_until_silence(
+        self,
+        prepared_stream: sd.InputStream | None = None,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Optional[str]:
         audio = self.config.audio
+        event_metadata = {"source": "wakeword", **dict(metadata or {})}
         self.logger.info("Start listening")
         self._emit(
             VoiceEvent(
                 kind=VoiceEventKind.LISTENING,
                 text="请开始说话",
-                metadata={"source": "wakeword"},
+                metadata=event_metadata,
             )
         )
 
@@ -270,7 +319,7 @@ class VoiceControlService:
                 stream.start()
             while total_time < audio.max_record_seconds:
                 if self.speech.is_stop_requested():
-                    self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "recording"}))
+                    self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
                     return None
 
                 data, _ = stream.read(block_size)
@@ -293,7 +342,7 @@ class VoiceControlService:
                                     kind=VoiceEventKind.ERROR,
                                     text="没有检测到有效语音",
                                     metadata={
-                                        "source": "wakeword",
+                                        **event_metadata,
                                         "stage": "recording",
                                         "recoverable": True,
                                     },
@@ -301,7 +350,7 @@ class VoiceControlService:
                             )
                             if self.config.tts.no_speech_beep_enabled:
                                 self.speech.play_sound_async(self.config.tts.no_speech_sound)
-                            self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "wakeword"}))
+                            self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
                             return None
 
                     if start_hit_count >= audio.start_hits_required:
@@ -326,7 +375,7 @@ class VoiceControlService:
                         kind=VoiceEventKind.ERROR,
                         text="没有检测到有效语音",
                         metadata={
-                            "source": "wakeword",
+                            **event_metadata,
                             "stage": "recording",
                             "recoverable": True,
                         },
@@ -334,7 +383,7 @@ class VoiceControlService:
                 )
                 if self.config.tts.no_speech_beep_enabled:
                     self.speech.play_sound_async(self.config.tts.no_speech_sound)
-                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata={"source": "wakeword"}))
+                self._emit(VoiceEvent(kind=VoiceEventKind.IDLE, metadata=event_metadata))
                 return None
 
             fd, path = tempfile.mkstemp(suffix=".wav")
@@ -357,11 +406,17 @@ class VoiceControlService:
             except Exception:
                 self.logger.exception("Failed to close input stream")
 
-    def handle_one_turn(self, wav_path: str) -> bool:
-        event_metadata = {"source": "wakeword"}
+    def handle_one_turn(
+        self,
+        wav_path: str,
+        *,
+        speak: bool = True,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> bool:
+        event_metadata = {"source": "wakeword", **dict(metadata or {})}
         try:
             try:
-                user_text = self.transcribe_file(wav_path)
+                user_text = self.transcribe_file(wav_path, metadata=event_metadata)
             except Exception as exc:
                 self.logger.exception("ASR failed during recorded turn")
                 self._emit(
@@ -400,7 +455,7 @@ class VoiceControlService:
                 )
             )
             try:
-                reply = self.ask_text(user_text, speak=True, metadata=event_metadata)
+                reply = self.ask_text(user_text, speak=speak, metadata=event_metadata)
             except Exception:
                 self.logger.exception("OpenClaw turn failed")
                 return False
@@ -415,21 +470,25 @@ class VoiceControlService:
                     self.logger.exception("Failed to remove temp wav file: %s", wav_path)
 
     def run(self) -> None:
+        if not self._input_mode_lock.acquire(blocking=False):
+            raise RuntimeError("voice input is already active")
         try:
-            self._run_service()
-        except Exception:
-            self.logger.exception("FATAL: service crashed, writing crash dump...")
-            crash_log = self.config.app.log_dir / "crash.log"
-            import traceback
+            try:
+                self._run_service()
+            except Exception:
+                self.logger.exception("FATAL: service crashed, writing crash dump...")
+                crash_log = self.config.app.log_dir / "crash.log"
+                import traceback
 
-            with open(str(crash_log), "w", encoding="utf-8") as f:
-                f.write("=" * 60 + "\n")
-                f.write("Voice Control Crash Report\n")
-                f.write("=" * 60 + "\n")
-                traceback.print_exc(file=f)
-            self.logger.info("Crash dump written to %s", str(crash_log))
-            raise
+                with open(str(crash_log), "w", encoding="utf-8") as f:
+                    f.write("=" * 60 + "\n")
+                    f.write("Voice Control Crash Report\n")
+                    f.write("=" * 60 + "\n")
+                    traceback.print_exc(file=f)
+                self.logger.info("Crash dump written to %s", str(crash_log))
+                raise
         finally:
+            self._input_mode_lock.release()
             self.close()
 
     def _run_service(self) -> None:
