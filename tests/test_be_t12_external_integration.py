@@ -3,11 +3,11 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from openclaw_voice_control import Presenter, VoiceControlService, VoiceEvent, VoiceEventKind
+from openclaw_voice_control import VoiceControlService, VoiceEvent, VoiceEventKind
 from openclaw_voice_control.config import load_config
 
 
-class RecordingPresenter(Presenter):
+class RecordingPresenter:
     def __init__(self) -> None:
         self.events: list[VoiceEvent] = []
 
@@ -22,6 +22,9 @@ class FakeASR:
 
 
 class FakeClient:
+    def __init__(self) -> None:
+        self.closed = 0
+
     def ask(self, text: str) -> str:
         return f"reply:{text}"
 
@@ -31,7 +34,7 @@ class FakeClient:
         return reply
 
     def close(self) -> None:
-        return None
+        self.closed += 1
 
 
 class FakeItem:
@@ -45,6 +48,7 @@ class FakeSpeech:
     def __init__(self, service: VoiceControlService) -> None:
         self.service = service
         self.stopped = False
+        self.closed = 0
 
     def clear_stop_request(self) -> None:
         self.service.runtime.clear_stop_speech()
@@ -68,16 +72,18 @@ class FakeSpeech:
         return True
 
     def close(self) -> None:
-        return None
+        self.closed += 1
 
 
 def test_be_t12_external_presenter_and_public_apis_smoke(tmp_path) -> None:
     presenter = RecordingPresenter()
     config_path = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
     service = VoiceControlService(load_config(config_path), presenter=presenter)
+    client = FakeClient()
+    speech = FakeSpeech(service)
     service.asr = FakeASR()
-    service.client = FakeClient()
-    service.speech = FakeSpeech(service)
+    service.client = client
+    service.speech = speech
 
     audio_path = tmp_path / "sample.wav"
     audio_path.write_bytes(b"fake-audio")
@@ -96,6 +102,11 @@ def test_be_t12_external_presenter_and_public_apis_smoke(tmp_path) -> None:
     assert presenter.events[0].metadata["message_id"] == "m1"
 
     service.stop_speaking()
-    assert service.speech.stopped is True
+    assert speech.stopped is True
     assert presenter.events[-1].kind == VoiceEventKind.IDLE
     assert presenter.events[-1].metadata["source"] == "stop_speaking"
+
+    service.close()
+    service.close()
+    assert speech.closed == 1
+    assert client.closed == 1
