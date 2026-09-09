@@ -2,16 +2,21 @@
 
 本项目只提供 Headless Voice Core，不包含桌宠窗口、角色立绘、动画、气泡或 UI 状态机。桌宠应用通过公开 Python API 和 `Presenter` 事件协议接入语音能力。
 
-适合的集成方式是：
+推荐架构：
 
 ```text
 桌宠 / GUI
-  ├─ 调用 VoiceControlService API
-  └─ Presenter 接收 VoiceEvent
+  ├─ 向 bridge 发送命令
+  └─ 接收 bridge 转发的 VoiceEvent
+          │
+          ▼
+bridge / worker
+  └─ 持有唯一 VoiceControlService 实例
           │
           ▼
 OpenClaw Voice Core
-  ├─ Wakeword / listen_once
+  ├─ set_input_mode()
+  ├─ Wakeword / listen_once()
   ├─ Recording
   ├─ FunASR / SenseVoice
   ├─ OpenClaw Gateway
@@ -23,6 +28,7 @@ OpenClaw Voice Core
 
 Voice Core 负责：
 
+- `wakeword` / `push_to_talk` 输入模式；
 - 唤醒词检测；
 - `listen_once()` 一次性按键/点击说话入口；
 - 麦克风录音与静音结束判断；
@@ -40,46 +46,35 @@ Voice Core 负责：
 - 角色动画；
 - 气泡文本；
 - `idle / listening / thinking / speaking / error` 到角色状态的映射；
-- 鼠标、键盘、菜单等交互；
+- 麦克风按钮、快捷键、菜单等交互；
+- “唤醒词模式 / 按键说话模式”的用户设置；
+- 将模式切换命令发给 bridge；
 - 是否显示用户识别文本、完整回复或当前朗读句子。
 
 不要让 Voice Core 直接 import PySide6、Qt、桌宠窗口类或角色资源。
 
 ## 2. 推荐线程模型
 
-`VoiceControlService.run()` 是阻塞式独立主循环，`listen_once()` 也会阻塞直到这一轮录音/识别/对话结束，所以都不要在 GUI 主线程直接运行。
-
-推荐：
+`VoiceControlService.run()` 是常驻阻塞循环，`listen_once()` 也会阻塞直到一轮录音/识别/对话结束，所以都不要在 GUI 主线程直接运行。
 
 ```text
 GUI 主线程
   │
   ├─ UI / 动画 / 气泡
-  ├─ 定时读取事件队列，或通过 GUI framework signal 转发
+  ├─ 模式切换按钮 / 麦克风按钮
+  ├─ 读取 Presenter 事件
   │
-  └──── API 调用任务 ───► 后台线程 / 线程池
-                         │
-                         ▼
-                  VoiceControlService
-                         │
-                         └──── VoiceEvent ───► Presenter ───► thread-safe queue
+  └──── command ───► bridge / worker threads
+                          │
+                          ▼
+                 VoiceControlService.run()
+                          │
+                          └──── VoiceEvent ───► Presenter queue ───► GUI
 ```
 
 `Presenter.emit()` 可能由 Voice Core 服务线程、`listen_once()` worker 或 Speech worker 调用，所以 GUI 必须把事件 marshal 回自己的 UI 主线程。
 
 ## 3. 最小 Presenter
-
-`Presenter` 只要求一个方法：
-
-```python
-from openclaw_voice_control import VoiceEvent
-
-class MyPresenter:
-    def emit(self, event: VoiceEvent) -> None:
-        ...
-```
-
-最简单、安全的做法是使用 `queue.Queue`：
 
 ```python
 import queue
@@ -95,29 +90,21 @@ class QueuePresenter:
         self.events.put(event)
 ```
 
-完整可运行示例见：
+完整示例见：
 
 - [`examples/external_presenter.py`](../examples/external_presenter.py)
 
-## 4. 初始化 Voice Core
+## 4. 初始化：只创建一次 Voice Core
 
 ```python
+import threading
+
 from openclaw_voice_control import VoiceControlService
 from openclaw_voice_control.config import load_config
 
 presenter = QueuePresenter()
 config = load_config("config/default.yaml", ".env")
 service = VoiceControlService(config, presenter=presenter)
-```
-
-Voice Core 有两种麦克风输入模式。
-
-### 4.1 常驻唤醒模式：run()
-
-如果桌宠需要完整语音唤醒模式，把 `service.run()` 放到后台线程：
-
-```python
-import threading
 
 voice_thread = threading.Thread(
     target=service.run,
@@ -127,21 +114,98 @@ voice_thread = threading.Thread(
 voice_thread.start()
 ```
 
-`run()` 会加载 ASR、启动本地 STT HTTP server、启动 wakeword，并进入：
+推荐 bridge 在整个桌宠生命周期里只持有这一份 `service`。
 
-```text
-wakeword
-  -> 唤醒确认音
-  -> recording
-  -> ASR
-  -> OpenClaw Gateway
-  -> streaming TTS
-  -> idle
+以后切换输入方式时：
+
+- 不重新 new `VoiceControlService`；
+- 不退出 `run()`；
+- 不重启 Python 进程；
+- 不重新加载 ASR / TTS / Gateway。
+
+## 5. 运行时切换输入模式
+
+### 5.1 唤醒词模式
+
+```python
+applied = service.set_input_mode("wakeword")
 ```
 
-### 4.2 按钮/热键触发：listen_once()
+生效后：
 
-如果桌宠不需要常驻唤醒词，而是希望用户点击麦克风按钮、按住快捷键或选择菜单后立即说话，直接在后台 worker 中调用：
+```text
+wakeword engine resume
+  -> 持续监听唤醒词
+  -> 命中后 recording -> ASR -> Gateway -> TTS
+```
+
+### 5.2 按键说话模式
+
+```python
+applied = service.set_input_mode("push_to_talk")
+```
+
+生效后：
+
+```text
+wakeword engine pause
+  -> run() 继续常驻
+  -> ASR / TTS / Gateway 保持加载
+  -> 等待桌宠调用 listen_once()
+```
+
+切换到 `push_to_talk` 时，wakeword 只是 `pause()`，不是 `close()`，所以已加载模型不会被卸载。
+
+### 5.3 `set_input_mode()` 的返回值
+
+```python
+applied = service.set_input_mode(mode)
+```
+
+- `True`：已经切换完成；
+- `False`：当前仍在录音、ASR、Gateway 对话或 TTS，已登记 pending，本轮结束后自动切换。
+
+bridge 可以直接给桌宠回复：
+
+```python
+if applied:
+    message = "语音输入模式已切换"
+else:
+    message = "当前对话结束后切换"
+```
+
+状态查询：
+
+```python
+service.get_input_mode()
+service.get_pending_input_mode()
+```
+
+### 5.4 pending 最终生效通知
+
+真正完成切换后，Voice Core 会发一个现有 `idle` 事件：
+
+```python
+{
+    "source": "input_mode",
+    "input_mode": "push_to_talk",
+    "mode_change": "applied",
+}
+```
+
+因此 bridge 可以在 `set_input_mode()` 返回 `False` 时先回复 pending，再等这个事件到来后通知桌宠“已完成切换”。
+
+详细安全规则见 [`input-modes.md`](input-modes.md)。
+
+## 6. 桌宠按钮触发 `listen_once()`
+
+当前模式必须已经是 `push_to_talk`：
+
+```python
+service.get_input_mode() == "push_to_talk"
+```
+
+然后在 bridge worker 中：
 
 ```python
 ok = service.listen_once(
@@ -153,7 +217,7 @@ ok = service.listen_once(
 )
 ```
 
-调用后**不会等待 wakeword**，而是立即进入：
+调用后不会等待 wakeword：
 
 ```text
 listen_once()
@@ -170,73 +234,127 @@ listen_once()
 
 参数：
 
-- `speak=True`：OpenClaw 回复会进入 TTS；
-- `speak=False`：完成录音、ASR 和 OpenClaw 对话，但不朗读回复；
-- `metadata`：会沿着 listening / recognized / thinking / reply / speaking / idle 等事件向外传递，默认 `source="listen_once"`，调用方可以覆盖为 `desktop_pet` 等来源。
+- `speak=True`：OpenClaw 回复进入 TTS；
+- `speak=False`：完成录音、ASR 和 OpenClaw 对话，但不朗读；
+- `metadata`：向下游事件透传，便于 bridge 关联 request id。
 
 返回：
 
 - `True`：本轮成功完成；
-- `False`：没有录到有效语音，或后续 recorded turn 未成功完成。
+- `False`：没有录到有效语音，或 recorded turn 未成功完成。
 
-如果打开麦克风本身抛异常，`listen_once()` 会先发 `error(stage="recording") -> idle`，再把异常抛给调用方。
-
-### 4.3 两种模式不要并发
-
-`run()` 和 `listen_once()` 都会占用语音输入，因此它们是**替代模式**，不是两个同时开启的入口。
-
-例如桌宠采用按钮说话模式时：
-
-```text
-创建 VoiceControlService
-  -> 不调用 run()
-  -> 用户点击麦克风按钮
-  -> worker 调用 listen_once()
-  -> 完成后等待下一次按钮触发
-```
-
-如果已经有一个 `run()` / `listen_once()` 占用输入，再触发另一个输入操作，会抛：
+如果 `run()` 正在运行且当前仍为 `wakeword`，直接调用会得到：
 
 ```python
-RuntimeError("voice input is already active")
+RuntimeError("listen_once requires push_to_talk input mode while run() is active")
 ```
 
-这样可以避免两个 `sounddevice.InputStream` 同时抢麦克风。
+这是一层安全保护，避免桌宠忘记切模式后又打开第二条麦克风链路。
 
-## 5. VoiceEvent 怎么映射到桌宠
+## 7. 两条输入路径共用同一把麦克风锁
 
-稳定事件类型：
+Voice Core 内部 wakeword 和 `listen_once()` 共用同一把 input lock。
+
+```text
+wakeword read / wake turn ----+
+                              +---- microphone input lock
+listen_once() ----------------+
+```
+
+因此模式切换顺序始终保证：
+
+```text
+wakeword -> push_to_talk
+  -> 等当前 read / turn 结束
+  -> input lock
+  -> wakeword.pause()
+  -> mode 生效
+  -> listen_once() 才能使用麦克风
+```
+
+以及：
+
+```text
+push_to_talk -> wakeword
+  -> 等 listen_once() 释放 input lock
+  -> wakeword.resume()
+  -> mode 生效
+```
+
+不会同时打开 wakeword stream 和 recording stream。
+
+## 8. bridge 命令建议
+
+桌宠只需要理解高层命令，不需要知道 openWakeWord / Porcupine 实现。
+
+### 切模式
+
+桌宠 -> bridge：
+
+```json
+{
+  "type": "set_voice_input_mode",
+  "mode": "push_to_talk"
+}
+```
+
+bridge：
+
+```python
+def handle_set_voice_input_mode(command):
+    applied = service.set_input_mode(command["mode"])
+    return {
+        "type": "voice_input_mode_result",
+        "status": "applied" if applied else "pending",
+        "mode": service.get_input_mode(),
+        "pending_mode": service.get_pending_input_mode(),
+    }
+```
+
+### 触发一次说话
+
+桌宠 -> bridge：
+
+```json
+{
+  "type": "listen_once",
+  "request_id": "voice-001"
+}
+```
+
+bridge worker：
+
+```python
+service.listen_once(
+    speak=True,
+    metadata={
+        "source": "desktop_pet",
+        "request_id": command["request_id"],
+    },
+)
+```
+
+## 9. VoiceEvent 怎么映射到桌宠
 
 | kind | 主要字段 | 常见桌宠行为 |
 | --- | --- | --- |
-| `idle` | `metadata` | 回到待机动画，隐藏或收起状态提示 |
+| `idle` | `metadata` | 回到待机动画；如果 `source=input_mode`，更新模式 UI |
 | `listening` | `text` | 显示“正在听”，切监听动画 |
 | `recognized` | `text`, `user_text` | 显示用户识别结果 |
 | `thinking` | `user_text` | 显示思考状态 |
 | `reply` | `text`, `user_text` | 显示完整 OpenClaw 回复 |
 | `speaking` | `text` | 显示当前朗读句子，切说话动画 |
-| `error` | `text`, `metadata` | 显示错误状态；可根据 `recoverable` 决定是否自动恢复 |
+| `error` | `text`, `metadata` | 显示错误；可根据 `recoverable` 决定自动恢复 |
 
-事件对象：
-
-```python
-@dataclass
-class VoiceEvent:
-    kind: VoiceEventKind
-    text: str
-    user_text: str
-    auto_hide_ms: int
-    metadata: Mapping[str, Any]
-```
-
-推荐只依赖稳定字段和 `kind`，不要让桌宠读取 Voice Core 内部对象。
-
-### 一个简单的 UI 映射例子
+简单映射：
 
 ```python
 def handle_voice_event(event):
-    kind = event.kind.value
+    if event.metadata.get("source") == "input_mode":
+        pet.set_voice_input_mode(event.metadata["input_mode"])
+        return
 
+    kind = event.kind.value
     if kind == "idle":
         pet.set_state("idle")
     elif kind == "listening":
@@ -256,34 +374,26 @@ def handle_voice_event(event):
         bubble.show(event.text)
 ```
 
-这里的 `pet`、`bubble` 都属于桌宠项目，不应放回 Voice Core 仓库。
+`pet`、`bubble` 都属于桌宠项目，不应放回 Voice Core 仓库。
 
-## 6. 桌宠主动发起文本对话
-
-如果用户在桌宠输入框输入文字，可以直接调用：
-
-```python
-reply = service.ask_text("今天天气怎么样？", speak=True)
-```
-
-- `speak=True`：返回文字，同时把流式回复送入 TTS；
-- `speak=False`：只进行 OpenClaw 文本对话，不朗读。
-
-推荐附带 metadata，方便桌宠区分来源：
+## 10. 桌宠主动发起文本对话
 
 ```python
 reply = service.ask_text(
-    "帮我总结一下今天的事项",
+    "今天天气怎么样？",
     speak=True,
     metadata={"source": "desktop_pet", "request_id": "chat-001"},
 )
 ```
 
-`ask_text()` 是阻塞调用，不要直接放到 GUI 主线程。应在线程池或后台 worker 中调用，UI 状态通过 Presenter 事件更新。
+- `speak=True`：返回文字并朗读；
+- `speak=False`：只返回文字。
 
-## 7. 桌宠主动让角色说一句话
+`ask_text()` 是阻塞调用，应放在线程池或后台 worker。
 
-如果不需要经过 OpenClaw，只想让桌宠朗读通知：
+如果此时用户请求切换 input mode，切换会等这轮 Gateway/TTS 完成后再生效。
+
+## 11. 桌宠主动让角色说一句话
 
 ```python
 service.speak_message(
@@ -292,7 +402,7 @@ service.speak_message(
 )
 ```
 
-等待朗读完成：
+等待完成：
 
 ```python
 service.speak_message("任务完成。", wait=True)
@@ -304,16 +414,9 @@ service.speak_message("任务完成。", wait=True)
 service.stop_speaking()
 ```
 
-这组 API 适合：
+如果朗读过程中请求切模式，同样会进入 pending，朗读结束后再切。
 
-- 桌宠主动通知；
-- 定时提醒；
-- 外部应用事件提示；
-- 菜单中的“停止说话”按钮。
-
-## 8. 桌宠识别已有音频文件
-
-如果桌宠自己拿到了 WAV 文件：
+## 12. 识别已有音频文件
 
 ```python
 text = service.transcribe_file(
@@ -322,11 +425,11 @@ text = service.transcribe_file(
 )
 ```
 
-该调用与内置 STT HTTP server 使用同一个 ASR lock，因此不会和其它识别任务并发进入 SenseVoice。
+该入口与 STT HTTP 共用同一个 ASR lock。
 
-## 9. 不直接嵌入 Python 时：使用 STT HTTP
+识别过程中请求切模式时，模式也会延后到识别完成后生效。
 
-独立服务默认提供：
+## 13. 不直接嵌入 Python 时：STT HTTP
 
 ```text
 POST http://127.0.0.1:15900/stt
@@ -335,19 +438,15 @@ Content-Type: application/json
 {"path": "C:/audio/input.wav"}
 ```
 
-成功响应：
+成功：
 
 ```json
 {"text": "识别结果"}
 ```
 
-如果桌宠不是 Python，或者希望把音频识别和 UI 进程解耦，可以使用这个接口。
+当前 HTTP 接口只解决本地文件 ASR；模式切换、OpenClaw 对话、TTS 和 VoiceEvent 仍推荐通过 Python bridge 调 Voice Core SDK。
 
-注意：当前 HTTP 接口只解决本地文件 ASR；OpenClaw 对话、TTS 和事件接入仍推荐直接使用 Python SDK。
-
-## 10. GUI 主线程消费事件
-
-### 通用 queue 模式
+## 14. GUI 主线程消费事件
 
 Voice Core 线程只写 queue：
 
@@ -355,7 +454,7 @@ Voice Core 线程只写 queue：
 presenter.events.put(event)
 ```
 
-GUI 主线程使用自己的 timer / event loop 定期读取：
+GUI 主线程定期读取：
 
 ```python
 def poll_voice_events():
@@ -367,9 +466,7 @@ def poll_voice_events():
         handle_voice_event(event)
 ```
 
-### PySide6 / Qt 项目
-
-Voice Core 仍然不要依赖 PySide6。Qt 项目可以在自己的代码中把 queue 事件转成 signal：
+### PySide6 / Qt
 
 ```text
 Voice Core Presenter
@@ -379,61 +476,44 @@ Voice Core Presenter
   -> QWidget / QML / 桌宠状态机
 ```
 
-按钮说话时，Qt click handler 不应直接调用阻塞的 `listen_once()`，而应把它提交给 `QThreadPool`、Python worker thread 或其它后台任务，然后继续通过 Presenter 事件刷新 UI。
+Qt click handler 不应直接执行阻塞的 `listen_once()` / `ask_text()`，应提交给 `QThreadPool`、Python worker thread 或其它后台任务。
 
-## 11. 生命周期建议
+## 15. 生命周期建议
 
-### 常驻唤醒模式
-
-启动：
+推荐整个桌宠生命周期：
 
 ```text
 创建 Presenter
   -> load_config
-  -> VoiceControlService
-  -> 后台启动 service.run()
+  -> 创建一次 VoiceControlService
+  -> 后台启动一次 service.run()
+  -> 运行期间反复 set_input_mode()
+  -> push_to_talk 时反复 listen_once()
+  -> 桌宠退出时 service.close()
 ```
 
-关闭桌宠时：
+关闭：
 
 ```python
 service.close()
 voice_thread.join(timeout=5)
 ```
 
-### 按键说话模式
-
-启动时只创建 `VoiceControlService`，不要启动 `run()`：
-
-```text
-创建 Presenter
-  -> load_config
-  -> VoiceControlService
-  -> 用户触发时 worker 调用 listen_once()
-```
-
-关闭时直接：
-
-```python
-service.close()
-```
-
 `close()` 是幂等的，可以安全重复调用。
 
-建议桌宠在以下场景统一调用 `close()`：
+模式切换本身绝对不应该调用 `close()` 或重启进程。
 
-- 用户退出桌宠；
-- Windows 注销/关机处理；
-- 开发模式热重启前；
-- Voice Core 线程异常退出后的清理流程。
-
-## 12. 推荐的桌宠状态机
-
-Voice Core 不规定 UI 状态机，但一般可以这样映射：
+## 16. 推荐桌宠状态机
 
 ```text
+input mode:
+  wakeword <---- set_input_mode() ----> push_to_talk
+                                         |
+                                         +-- listen_once()
+
+conversation state:
 idle
- ├─ listening        # wakeword 后录音，或 listen_once() 直接进入
+ ├─ listening
  │    └─ recognized
  │         └─ thinking
  │              ├─ speaking
@@ -445,17 +525,21 @@ idle
       └─ idle
 ```
 
-不要假设所有事件都严格来自一个线程，也不要把动画完成作为 Voice Core 继续运行的前置条件。
+input mode 与角色动画状态是两个不同维度，不要把 `push_to_talk` 当成 `VoiceEventKind`。
 
-## 13. 常用 API 速查
+## 17. 常用 API 速查
 
 ```python
-service.listen_once(speak=True, metadata=None)         # -> bool, 不经过 wakeword
+service.set_input_mode("wakeword")                   # -> bool
+service.set_input_mode("push_to_talk")               # -> bool
+service.get_input_mode()                              # -> str
+service.get_pending_input_mode()                      # -> str | None
+service.listen_once(speak=True, metadata=None)         # -> bool
 service.transcribe_file(path, metadata=None)          # -> str
 service.ask_text(text, speak=True, metadata=None)     # -> str
 service.speak_message(text, metadata=None, wait=False)
 service.stop_speaking()
-service.run()                                         # blocking wakeword mode
+service.run()                                         # persistent blocking service
 service.close()                                       # idempotent
 ```
 
@@ -472,14 +556,14 @@ from openclaw_voice_control import (
 )
 ```
 
-## 14. 继续阅读
+## 18. 继续阅读
 
+- 输入模式切换：[`input-modes.md`](input-modes.md)
 - 整体架构：[`architecture.md`](architecture.md)
 - 事件协议：[`modules/events-and-text.md`](modules/events-and-text.md)
-- Standalone / push-to-talk 输入模式：[`modules/main-loop.md`](modules/main-loop.md)
+- 常驻主循环：[`modules/main-loop.md`](modules/main-loop.md)
 - Gateway：[`modules/gateway-ws.md`](modules/gateway-ws.md)
 - ASR：[`modules/asr.md`](modules/asr.md)
 - TTS：[`modules/tts.md`](modules/tts.md)
 - Wakeword：[`modules/wakeword.md`](modules/wakeword.md)
 - 配置：[`modules/cli-and-config.md`](modules/cli-and-config.md)
-- 原始重构 API 设计：[`PRD/2026-09-09-voice-core-sdk-refactor/api-design.md`](PRD/2026-09-09-voice-core-sdk-refactor/api-design.md)
