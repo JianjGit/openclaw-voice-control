@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import tempfile
 import threading
 import time
 import wave
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 import numpy as np
 import requests
@@ -24,6 +22,7 @@ from .presenter import NullPresenter, Presenter
 from .runtime import RuntimeControl
 from .speech import SpeechController
 from .state import OverlayStateManager
+from .stt_server import STTServer
 from .text import clean_text_for_overlay
 from .tts import WindowsTTS
 from .wakeword import build_wakeword_engine
@@ -42,7 +41,8 @@ class VoiceControlService:
         self.tts = WindowsTTS(config.tts)
         self.speech = SpeechController(self.tts, self.runtime, self._emit, logger=self.logger)
         self.asr = FunASRSenseVoice(config.asr)
-        self.asr_lock = threading.Lock()
+        self._asr_lock = threading.Lock()
+        self.stt_server = STTServer(self.transcribe_file, logger=self.logger)
         self.wakeword = build_wakeword_engine(config.wakeword)
         self.state = OverlayStateManager(config.overlay)
 
@@ -105,6 +105,20 @@ class VoiceControlService:
             self.presenter.emit(event)
         except Exception:
             self.logger.exception("Presenter failed while handling %s", event.kind.value)
+
+    def transcribe_file(
+        self,
+        path: str | Path,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Transcribe an audio file through the service-wide serialized ASR path."""
+        del metadata  # reserved for future tracing without changing ASR semantics
+        audio_path = Path(path).expanduser()
+        if not audio_path.is_file():
+            raise FileNotFoundError(str(audio_path))
+        with self._asr_lock:
+            return self.asr.transcribe(str(audio_path))
 
     def update_overlay_state(
         self,
@@ -229,7 +243,7 @@ class VoiceControlService:
 
     def handle_one_turn(self, wav_path: str) -> bool:
         try:
-            user_text = self.asr.transcribe(wav_path)
+            user_text = self.transcribe_file(wav_path)
             self.logger.info("ASR: %s", user_text[:100] if user_text else "(empty)")
             if not user_text:
                 self.update_overlay_state("no_speech", meta_text="没有识别出有效文本", auto_hide_ms=2200)
@@ -281,40 +295,6 @@ class VoiceControlService:
                 except Exception:
                     self.logger.exception("Failed to remove temp wav file: %s", wav_path)
 
-    def _start_stt_http_server(self, host: str = "127.0.0.1", port: int = 15900) -> None:
-        """启动 STT HTTP 接口（常驻守护线程），供 OpenClaw 的 tools.media.audio CLI 调用。"""
-        service_ref = self
-
-        class STTHandler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                if self.path != "/stt":
-                    self.send_error(404)
-                    return
-                try:
-                    content_length = int(self.headers.get("Content-Length", 0))
-                    body = self.rfile.read(content_length)
-                    data = json.loads(body)
-                    audio_path = data.get("path", "")
-                    if not audio_path or not os.path.isfile(audio_path):
-                        self.send_error(400, "Missing or invalid path")
-                        return
-                    with service_ref.asr_lock:
-                        text = service_ref.asr.transcribe(audio_path)
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"text": text}, ensure_ascii=False).encode("utf-8"))
-                except Exception:
-                    service_ref.logger.exception("STT HTTP error")
-                    self.send_error(500)
-
-            def log_message(self, format, *args):
-                pass
-
-        server = HTTPServer((host, port), STTHandler)
-        service_ref.logger.info("STT HTTP server listening on http://%s:%d/stt", host, port)
-        server.serve_forever()
-
     def run(self) -> None:
         try:
             self._run_service()
@@ -331,6 +311,7 @@ class VoiceControlService:
             self.logger.info("Crash dump written to %s", str(crash_log))
             raise
         finally:
+            self.stt_server.close()
             self.speech.close()
             self.client.close()
 
@@ -344,8 +325,7 @@ class VoiceControlService:
         self.logger.info("Loading ASR model...")
         self.asr.load()
         self.logger.info("ASR model ready")
-        stt_thread = threading.Thread(target=self._start_stt_http_server, daemon=True)
-        stt_thread.start()
+        self.stt_server.start()
         self._start_wakeword_engine()
         self.speech.clear_stop_request()
         self.state.ensure_idle_state(reset=True)
