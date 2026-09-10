@@ -14,7 +14,7 @@ OpenClaw Voice Control turns a Windows machine into a reusable voice layer: wake
 - Microphone recording with silence-based end detection.
 - Local SenseVoice / FunASR speech recognition.
 - Local `POST /stt` HTTP endpoint for file transcription.
-- OpenClaw Gateway conversation over WebSocket with session fallback.
+- OpenClaw Gateway protocol v4 conversation over WebSocket with session fallback.
 - Streaming sentence-by-sentence TTS through Windows SAPI5.
 - FIFO speech queue with stop / shutdown control.
 - Public Python SDK for voice input, text chat, transcription and active speech.
@@ -27,7 +27,7 @@ The core intentionally contains no desktop-pet UI, PySide6 overlay, character as
 
 - Windows
 - Python 3.11+
-- A reachable OpenClaw Gateway
+- A reachable OpenClaw Gateway that supports **protocol v4**
 - Local SenseVoice model files
 - A microphone for voice input
 
@@ -204,7 +204,7 @@ Main technologies:
 - **Wakeword:** openWakeWord, optional Porcupine
 - **Audio:** `sounddevice` + NumPy
 - **ASR:** FunASR + SenseVoice
-- **Conversation:** OpenClaw Gateway WebSocket + session JSONL fallback
+- **Conversation:** OpenClaw Gateway protocol v4 over WebSocket + session JSONL fallback
 - **TTS:** Windows SAPI5
 - **Concurrency:** Python threads, locks, conditions, queues and runtime events
 - **Integration:** framework-neutral `VoiceEvent` / `Presenter`
@@ -269,7 +269,7 @@ docs/
 │  ├─ wakeword.md          # wakeword providers and lifecycle
 │  ├─ record.md            # microphone recording and silence detection
 │  ├─ asr.md               # SenseVoice / FunASR
-│  ├─ gateway-ws.md        # OpenClaw WebSocket and response aggregation
+│  ├─ gateway-ws.md        # OpenClaw Gateway protocol v4, WebSocket and response aggregation
 │  ├─ tts.md               # Windows TTS and SpeechController
 │  └─ events-and-text.md   # VoiceEvent protocol and text cleanup
 │
@@ -322,6 +322,6 @@ See [`scripts/README.md`](scripts/README.md).
 python -m pytest -q
 ```
 
-Automated coverage includes events, runtime control, speech queue semantics, ASR serialization, STT HTTP, `listen_once()`, runtime input-mode switching, text conversation, active speech, wakeword orchestration, Gateway aggregation/deduplication, configuration and external Presenter/API integration.
+Automated coverage includes events, runtime control, speech queue semantics, ASR serialization, STT HTTP, `listen_once()`, runtime input-mode switching, text conversation, active speech, wakeword orchestration, Gateway protocol v4 handshake/aggregation/deduplication, configuration and external Presenter/API integration.
 
 Hardware-dependent validation is documented in [`docs/same-machine-test.md`](docs/same-machine-test.md).
