@@ -1,0 +1,87 @@
+# Tracked configuration template.
+# Copy this file to config/default.yaml for local runtime use.
+# config/default.yaml is intentionally gitignored so local settings never block git pull.
+
+app:
+  name: openclaw-voice-control
+  platform: windows
+  log_dir: logs
+  log_level: INFO
+
+openclaw:
+  base_url: ${OPENCLAW_BASE_URL}
+  ws_url: ${OPENCLAW_WS_URL}
+  agent_id: ${OPENCLAW_AGENT_ID}
+  session_key: ${OPENCLAW_SESSION_KEY}
+  home_dir: ${OPENCLAW_HOME}
+  timeout_seconds: 120
+  ws_timeout: 30
+
+# Final assistant replies stay local unless mirror delivery is explicitly enabled.
+delivery:
+  mode: off
+  target: ""
+  # Privacy-sensitive opt-in. When true, recognized user speech is sent to the
+  # selected preconfigured delivery target before the normal chat.send request.
+  include_user_transcript: false
+
+# Preconfigured delivery allowlist. Channel credentials belong in OpenClaw Gateway,
+# never in Voice Core. Uncomment and edit only the targets you intend to allow.
+delivery_targets:
+  # feishu_jie:
+  #   channel: feishu
+  #   account_id: default
+  #   to: user:ou_84727a25ab32163de1ebd612aca75627
+  # discord_home:
+  #   channel: discord
+  #   account_id: default
+  #   to: channel:123456789012345678
+
+stt:
+  host: 127.0.0.1
+  port: 15900
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  input_device_index: -1
+  silence_threshold: 0.008
+  silence_seconds_end: 1.2
+  max_record_seconds: 60
+  min_speech_seconds: 0.4
+  start_timeout_seconds: 3.0
+  start_hits_required: 3
+  start_hit_threshold: 0.008
+  max_pending_blocks: 10
+
+wakeword:
+  provider: openwakeword
+  model_name: hey jarvis
+  model_path:
+  keyword_path:
+  threshold: 0.35
+  cooldown_seconds: 1.5
+  rearm_seconds_after_turn: 0.0
+
+tts:
+  engine: windows_sapi5
+  voice: zh-CN-HUIHUI
+  wake_ack: 我在
+  followup_beep_enabled: false
+  followup_beep_sound:
+  record_done_beep_enabled: false
+  record_done_sound:
+  no_speech_beep_enabled: false
+  no_speech_sound:
+  post_reply_delay: 0.0
+
+asr:
+  provider: funasr
+  model: iic/SenseVoiceSmall
+  vad_model: fsmn-vad
+  model_path: models/SenseVoiceSmall
+  vad_model_path: models/fsmn-vad
+  language: zh
+  device: cpu
+  disable_update: true
+  disable_pbar: true
