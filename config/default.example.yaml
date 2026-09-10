@@ -1,6 +1,6 @@
 # Tracked configuration template.
-# Copy this file to config/default.yaml for local runtime use.
-# config/default.yaml is intentionally gitignored so local settings never block git pull.
+# Copy this file to config/local.yaml for local runtime use.
+# config/local.yaml is intentionally gitignored so local settings never block git pull.
 
 app:
   name: openclaw-voice-control
