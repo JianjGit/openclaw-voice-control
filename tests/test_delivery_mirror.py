@@ -178,6 +178,13 @@ def test_config_defaults_delivery_off(tmp_path, monkeypatch) -> None:
     assert config.delivery_targets == {}
 
 
+def test_config_rejects_invalid_mode(tmp_path, monkeypatch) -> None:
+    _clear_delivery_env(monkeypatch)
+    path = _write_config(tmp_path, "delivery:\n  mode: broadcast\n  target: ''\n")
+    with pytest.raises(ValueError, match="off, mirror"):
+        load_config(path)
+
+
 def test_config_rejects_unknown_target(tmp_path, monkeypatch) -> None:
     _clear_delivery_env(monkeypatch)
     path = _write_config(
@@ -196,6 +203,37 @@ def test_config_rejects_illegal_channel(tmp_path, monkeypatch) -> None:
         "delivery_targets:\n  dashboard:\n    channel: webchat\n    account_id: default\n    to: dashboard\n",
     )
     with pytest.raises(ValueError, match="supported external channel"):
+        load_config(path)
+
+
+def test_config_rejects_empty_delivery_to(tmp_path, monkeypatch) -> None:
+    _clear_delivery_env(monkeypatch)
+    path = _write_config(
+        tmp_path,
+        "delivery:\n  mode: off\n  target: ''\n"
+        "delivery_targets:\n"
+        "  discord_home:\n"
+        "    channel: discord\n"
+        "    account_id: default\n"
+        "    to: ''\n",
+    )
+    with pytest.raises(ValueError, match="delivery_targets.discord_home.to must not be empty"):
+        load_config(path)
+
+
+def test_config_rejects_channel_credentials_in_target(tmp_path, monkeypatch) -> None:
+    _clear_delivery_env(monkeypatch)
+    path = _write_config(
+        tmp_path,
+        "delivery:\n  mode: off\n  target: ''\n"
+        "delivery_targets:\n"
+        "  feishu_jie:\n"
+        "    channel: feishu\n"
+        "    account_id: default\n"
+        "    to: user:ou_demo\n"
+        "    app_secret: must_not_live_here\n",
+    )
+    with pytest.raises(ValueError, match="must not contain channel credentials"):
         load_config(path)
 
 
