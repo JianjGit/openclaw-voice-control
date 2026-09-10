@@ -237,6 +237,43 @@ def test_config_rejects_channel_credentials_in_target(tmp_path, monkeypatch) -> 
         load_config(path)
 
 
+def test_config_accepts_gateway_target_shapes(tmp_path, monkeypatch) -> None:
+    _clear_delivery_env(monkeypatch)
+    path = _write_config(
+        tmp_path,
+        "delivery:\n  mode: mirror\n  target: discord_home\n"
+        "delivery_targets:\n"
+        "  feishu_jie:\n"
+        "    channel: feishu\n"
+        "    account_id: default\n"
+        "    to: user:ou_demo\n"
+        "  discord_home:\n"
+        "    channel: discord\n"
+        "    account_id: default\n"
+        "    to: channel:123456789012345678\n",
+    )
+
+    config = load_config(path)
+
+    assert config.delivery_targets["feishu_jie"].to == "user:ou_demo"
+    assert config.delivery_targets["discord_home"].to == "channel:123456789012345678"
+
+
+def test_config_rejects_ambiguous_discord_numeric_target(tmp_path, monkeypatch) -> None:
+    _clear_delivery_env(monkeypatch)
+    path = _write_config(
+        tmp_path,
+        "delivery:\n  mode: off\n  target: ''\n"
+        "delivery_targets:\n"
+        "  discord_home:\n"
+        "    channel: discord\n"
+        "    account_id: default\n"
+        "    to: '123456789012345678'\n",
+    )
+    with pytest.raises(ValueError, match="valid Discord target"):
+        load_config(path)
+
+
 def test_config_env_overrides_preconfigured_target_only(tmp_path, monkeypatch) -> None:
     _clear_delivery_env(monkeypatch)
     path = _write_config(
