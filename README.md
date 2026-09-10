@@ -15,6 +15,7 @@ OpenClaw Voice Control turns a Windows machine into a reusable voice layer: wake
 - Local SenseVoice / FunASR speech recognition.
 - Local `POST /stt` HTTP endpoint for file transcription.
 - OpenClaw Gateway protocol v4 conversation over WebSocket with session fallback.
+- Optional, default-off mirroring of final assistant replies to preconfigured Feishu or Discord targets through OpenClaw Gateway.
 - Streaming sentence-by-sentence TTS through Windows SAPI5.
 - FIFO speech queue with stop / shutdown control.
 - Public Python SDK for voice input, text chat, transcription and active speech.
@@ -78,6 +79,53 @@ wakeword
   -> Windows SAPI5
   -> idle
 ```
+
+### Optional mirror delivery
+
+Assistant-reply delivery is separate from conversation routing. `OPENCLAW_SESSION_KEY` continues to select the agent/session/context that answers the voice turn. It does not select an IM recipient.
+
+Mirror delivery is disabled by default, so the existing local display/TTS behavior does not produce any external message:
+
+```yaml
+delivery:
+  mode: off
+  target: ""
+```
+
+To allow delivery, declare destinations under `delivery_targets` and select one by name:
+
+```yaml
+delivery:
+  mode: mirror
+  target: feishu_jie
+
+delivery_targets:
+  feishu_jie:
+    channel: feishu
+    account_id: default
+    to: user:ou_84727a25ab32163de1ebd612aca75627
+
+  discord_home:
+    channel: discord
+    account_id: default
+    to: channel:123456789012345678
+```
+
+Only names already declared in `delivery_targets` can be selected. Voice transcripts and model replies are never interpreted as delivery targets. The current Voice Core allowlist supports `feishu` and `discord`; unsupported channels, unknown targets, empty destinations, and credential fields fail configuration loading before the service starts.
+
+Environment variables can override the mode, selected name, or fields of a target that is already declared in YAML:
+
+```dotenv
+OPENCLAW_DELIVERY_MODE=mirror
+OPENCLAW_DELIVERY_TARGET=feishu_jie
+OPENCLAW_DELIVERY_TARGET_FEISHU_JIE_CHANNEL=feishu
+OPENCLAW_DELIVERY_TARGET_FEISHU_JIE_ACCOUNT_ID=default
+OPENCLAW_DELIVERY_TARGET_FEISHU_JIE_TO=user:ou_84727a25ab32163de1ebd612aca75627
+```
+
+Delivery happens only after the final assistant reply has been collected. Voice Core uses the Gateway protocol v4 `send` RPC with one idempotency key and does not request the model again. A delivery error is best-effort: it is logged without the reply body, destination value, token, or provider secret, while the original reply and local TTS continue normally.
+
+Channel credentials such as Feishu app secrets or Discord bot tokens must remain in the OpenClaw Gateway configuration. Do not put them in `delivery_targets` or on the desktop-pet side. Dashboard/WebChat is an internal conversation surface rather than a generic outbound channel; it sees the shared session history through the normal session, and is deliberately not accepted as a mirror target.
 
 ### Switch input mode at runtime
 
@@ -322,6 +370,6 @@ See [`scripts/README.md`](scripts/README.md).
 python -m pytest -q
 ```
 
-Automated coverage includes events, runtime control, speech queue semantics, ASR serialization, STT HTTP, `listen_once()`, runtime input-mode switching, text conversation, active speech, wakeword orchestration, Gateway protocol v4 handshake/aggregation/deduplication, configuration and external Presenter/API integration.
+Automated coverage includes events, runtime control, speech queue semantics, ASR serialization, STT HTTP, `listen_once()`, runtime input-mode switching, text conversation, active speech, wakeword orchestration, Gateway protocol v4 handshake/aggregation/deduplication, optional mirror delivery, configuration and external Presenter/API integration.
 
 Hardware-dependent validation is documented in [`docs/same-machine-test.md`](docs/same-machine-test.md).
