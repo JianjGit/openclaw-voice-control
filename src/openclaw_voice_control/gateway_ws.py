@@ -115,8 +115,8 @@ class GatewayWebSocket:
         await self._send_async(
             "connect",
             {
-                "minProtocol": 3,
-                "maxProtocol": 3,
+                "minProtocol": 4,
+                "maxProtocol": 4,
                 "client": {
                     "id": "gateway-client",
                     "version": "1.0.0",
@@ -195,7 +195,7 @@ class GatewayWebSocket:
         if self._ws is None:
             raise RuntimeError("WebSocket is not connected")
 
-        tagged_text = f"\U0001f3a4 {text}"
+        tagged_text = f"🎤 {text}"
         # Record before chat.send so a slow ACK cannot move the session matching window forward.
         send_timestamp = time.time()
         req_id = await self._send_async(
@@ -243,7 +243,7 @@ class GatewayWebSocket:
             session_snapshot = self._read_session_snapshot(
                 session_dir,
                 send_timestamp=send_timestamp,
-                tagged="\U0001f3a4",
+                tagged="🎤",
             )
             if session_snapshot:
                 before = accumulator.full_text
