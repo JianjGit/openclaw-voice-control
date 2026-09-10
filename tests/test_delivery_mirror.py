@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from openclaw_voice_control.config import DeliveryConfig, DeliveryTargetConfig, load_config
-from openclaw_voice_control.openclaw_client import OpenClawClient
+from openclaw_voice_control.openclaw_client import OpenClawClient, USER_TRANSCRIPT_MESSAGE_TEMPLATE
 
 
 class FakeGateway:
@@ -15,6 +15,7 @@ class FakeGateway:
         self.sequence: list[str] = []
 
     def chat_send_streaming(self, _text: str, on_sentence=None) -> str:
+        self.sequence.append("chat")
         if on_sentence is not None:
             self.sequence.append("sentence")
             on_sentence("最终回复。")
@@ -24,11 +25,19 @@ class FakeGateway:
         pass
 
 
-def _client_config(mode: str = "off", target: str = ""):
+def _client_config(
+    mode: str = "off",
+    target: str = "",
+    include_user_transcript: bool = False,
+):
     return SimpleNamespace(
         agent_id="main",
         ws_timeout=2,
-        delivery=DeliveryConfig(mode=mode, target=target),
+        delivery=DeliveryConfig(
+            mode=mode,
+            target=target,
+            include_user_transcript=include_user_transcript,
+        ),
         delivery_targets={
             "feishu_jie": DeliveryTargetConfig(
                 channel="feishu",
@@ -51,9 +60,10 @@ def test_delivery_default_off_does_not_send() -> None:
 
     assert client.ask("hello") == "最终回复。"
     assert gateway.deliveries == []
+    assert gateway.sequence == ["chat"]
 
 
-def test_delivery_mirror_sends_selected_target_once() -> None:
+def test_delivery_mirror_default_scope_sends_assistant_once() -> None:
     gateway = FakeGateway()
 
     class RecordingClient(OpenClawClient):
@@ -64,23 +74,86 @@ def test_delivery_mirror_sends_selected_target_once() -> None:
     client = RecordingClient(_client_config("mirror", "feishu_jie"), _ws=gateway)  # type: ignore[arg-type]
 
     assert client.ask("hello") == "最终回复。"
-    assert gateway.deliveries == [
-        {
-            "message": "最终回复。",
-            "channel": "feishu",
-            "account_id": "default",
-            "to": "user:ou_demo",
-        }
+    assert len(gateway.deliveries) == 1
+    delivery = gateway.deliveries[0]
+    assert delivery["message"] == "最终回复。"
+    assert delivery["channel"] == "feishu"
+    assert delivery["account_id"] == "default"
+    assert delivery["to"] == "user:ou_demo"
+    assert delivery["idempotency_key"]
+    assert gateway.sequence == ["chat"]
+
+
+def test_delivery_full_conversation_orders_user_chat_assistant() -> None:
+    gateway = FakeGateway()
+
+    class RecordingClient(OpenClawClient):
+        def _send_gateway_delivery(self, message: str, **kwargs):
+            gateway.sequence.append(f"delivery:{message}")
+            gateway.deliveries.append({"message": message, **kwargs})
+            return {}
+
+    client = RecordingClient(
+        _client_config("mirror", "feishu_jie", include_user_transcript=True),
+        _ws=gateway,
+    )  # type: ignore[arg-type]
+
+    assert client.ask("你好") == "最终回复。"
+    assert gateway.sequence == [
+        "delivery:语音：「你好」",
+        "chat",
+        "delivery:最终回复。",
     ]
+    assert [item["message"] for item in gateway.deliveries] == ["语音：「你好」", "最终回复。"]
+    assert gateway.deliveries[0]["idempotency_key"] != gateway.deliveries[1]["idempotency_key"]
 
 
-def test_delivery_failure_keeps_reply_and_stream_callback() -> None:
+def test_user_transcript_delivery_failure_keeps_chat_reply_tts_and_assistant_attempt(caplog) -> None:
+    gateway = FakeGateway()
+
+    class UserFailingClient(OpenClawClient):
+        def _send_gateway_delivery(self, message: str, **kwargs):
+            gateway.sequence.append(f"delivery:{message}")
+            if message.startswith("语音：「"):
+                raise RuntimeError("provider secret detail that must not be logged")
+            gateway.deliveries.append({"message": message, **kwargs})
+            return {}
+
+    client = UserFailingClient(
+        _client_config("mirror", "feishu_jie", include_user_transcript=True),
+        _ws=gateway,
+    )  # type: ignore[arg-type]
+    spoken: list[str] = []
+
+    reply = client.ask_streaming("敏感语音内容", spoken.append)
+
+    assert reply == "最终回复。"
+    assert spoken == ["最终回复。"]
+    assert gateway.sequence == [
+        "delivery:语音：「敏感语音内容」",
+        "chat",
+        "sentence",
+        "delivery:最终回复。",
+    ]
+    assert [item["message"] for item in gateway.deliveries] == ["最终回复。"]
+    assert "kind=user_transcript" in caplog.text
+    assert "target=feishu_jie" in caplog.text
+    assert "channel=feishu" in caplog.text
+    assert "success=false" in caplog.text
+    assert "敏感语音内容" not in caplog.text
+    assert "user:ou_demo" not in caplog.text
+    assert "provider secret detail" not in caplog.text
+
+
+def test_assistant_delivery_failure_keeps_reply_and_stream_callback() -> None:
     gateway = FakeGateway()
 
     class FailingClient(OpenClawClient):
-        def _send_gateway_delivery(self, *_args, **_kwargs):
-            gateway.sequence.append("delivery")
-            raise RuntimeError("provider secret detail that must not be logged")
+        def _send_gateway_delivery(self, message: str, **_kwargs):
+            gateway.sequence.append(f"delivery:{message}")
+            if message == "最终回复。":
+                raise RuntimeError("provider secret detail that must not be logged")
+            return {}
 
     client = FailingClient(_client_config("mirror", "feishu_jie"), _ws=gateway)  # type: ignore[arg-type]
     spoken: list[str] = []
@@ -89,12 +162,13 @@ def test_delivery_failure_keeps_reply_and_stream_callback() -> None:
 
     assert reply == "最终回复。"
     assert spoken == ["最终回复。"]
-    assert gateway.sequence == ["sentence", "delivery"]
+    assert gateway.sequence == ["chat", "sentence", "delivery:最终回复。"]
 
 
 def test_streaming_sentences_do_not_duplicate_delivery() -> None:
     class MultiSentenceGateway(FakeGateway):
         def chat_send_streaming(self, _text: str, on_sentence=None) -> str:
+            self.sequence.append("chat")
             if on_sentence is not None:
                 on_sentence("第一句。")
                 on_sentence("第二句。")
@@ -107,18 +181,22 @@ def test_streaming_sentences_do_not_duplicate_delivery() -> None:
             gateway.deliveries.append({"message": message, **kwargs})
             return {}
 
-    client = RecordingClient(_client_config("mirror", "feishu_jie"), _ws=gateway)  # type: ignore[arg-type]
+    client = RecordingClient(
+        _client_config("mirror", "feishu_jie", include_user_transcript=True),
+        _ws=gateway,
+    )  # type: ignore[arg-type]
     spoken: list[str] = []
 
     reply = client.ask_streaming("hello", spoken.append)
 
     assert reply == "第一句。第二句。"
     assert spoken == ["第一句。", "第二句。"]
-    assert len(gateway.deliveries) == 1
-    assert gateway.deliveries[0]["message"] == reply
+    assert len(gateway.deliveries) == 2
+    assert gateway.deliveries[0]["message"] == USER_TRANSCRIPT_MESSAGE_TEMPLATE.format(text="hello")
+    assert gateway.deliveries[1]["message"] == reply
 
 
-def test_gateway_v4_delivery_uses_send_rpc_without_session_key() -> None:
+def test_gateway_v4_delivery_uses_send_rpc_without_session_or_fake_identity_fields() -> None:
     class RpcGateway:
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict]] = []
@@ -138,10 +216,11 @@ def test_gateway_v4_delivery_uses_send_rpc_without_session_key() -> None:
     payload = asyncio.run(
         client._send_gateway_delivery_async(
             gateway,  # type: ignore[arg-type]
-            "最终回复。",
+            "语音：「你好」",
             channel="feishu",
             account_id="default",
             to="user:ou_demo",
+            idempotency_key="idem-user",
         )
     )
 
@@ -149,13 +228,18 @@ def test_gateway_v4_delivery_uses_send_rpc_without_session_key() -> None:
     assert len(gateway.calls) == 1
     method, params = gateway.calls[0]
     assert method == "send"
-    assert params["channel"] == "feishu"
-    assert params["accountId"] == "default"
-    assert params["to"] == "user:ou_demo"
-    assert params["message"] == "最终回复。"
-    assert params["agentId"] == "main"
-    assert params["idempotencyKey"]
+    assert params == {
+        "to": "user:ou_demo",
+        "message": "语音：「你好」",
+        "channel": "feishu",
+        "accountId": "default",
+        "agentId": "main",
+        "idempotencyKey": "idem-user",
+    }
     assert "sessionKey" not in params
+    assert "role" not in params
+    assert "sender" not in params
+    assert "metadata" not in params
 
 
 def _write_config(tmp_path, text: str):
@@ -170,12 +254,43 @@ def _clear_delivery_env(monkeypatch) -> None:
             monkeypatch.delenv(key, raising=False)
 
 
-def test_config_defaults_delivery_off(tmp_path, monkeypatch) -> None:
+def test_config_defaults_delivery_off_and_user_transcript_disabled(tmp_path, monkeypatch) -> None:
     _clear_delivery_env(monkeypatch)
     config = load_config(_write_config(tmp_path, "{}\n"))
     assert config.delivery.mode == "off"
     assert config.delivery.target == ""
+    assert config.delivery.include_user_transcript is False
     assert config.delivery_targets == {}
+
+
+def test_config_accepts_user_transcript_true(tmp_path, monkeypatch) -> None:
+    _clear_delivery_env(monkeypatch)
+    path = _write_config(tmp_path, "delivery:\n  mode: off\n  include_user_transcript: true\n")
+    config = load_config(path)
+    assert config.delivery.include_user_transcript is True
+
+
+def test_config_env_overrides_user_transcript_boolean(tmp_path, monkeypatch) -> None:
+    _clear_delivery_env(monkeypatch)
+    path = _write_config(tmp_path, "delivery:\n  mode: off\n  include_user_transcript: false\n")
+    monkeypatch.setenv("OPENCLAW_DELIVERY_INCLUDE_USER_TRANSCRIPT", "true")
+    config = load_config(path)
+    assert config.delivery.include_user_transcript is True
+
+
+def test_config_rejects_invalid_user_transcript_boolean(tmp_path, monkeypatch) -> None:
+    _clear_delivery_env(monkeypatch)
+    path = _write_config(tmp_path, "delivery:\n  mode: off\n  include_user_transcript: 'yes'\n")
+    with pytest.raises(ValueError, match="boolean true or false"):
+        load_config(path)
+
+
+def test_config_rejects_invalid_user_transcript_env_boolean(tmp_path, monkeypatch) -> None:
+    _clear_delivery_env(monkeypatch)
+    path = _write_config(tmp_path, "delivery:\n  mode: off\n  include_user_transcript: false\n")
+    monkeypatch.setenv("OPENCLAW_DELIVERY_INCLUDE_USER_TRANSCRIPT", "1")
+    with pytest.raises(ValueError, match="must be true or false"):
+        load_config(path)
 
 
 def test_config_rejects_invalid_mode(tmp_path, monkeypatch) -> None:
@@ -291,5 +406,9 @@ def test_config_env_overrides_preconfigured_target_only(tmp_path, monkeypatch) -
 
     config = load_config(path)
 
-    assert config.delivery == DeliveryConfig(mode="mirror", target="feishu_jie")
+    assert config.delivery == DeliveryConfig(
+        mode="mirror",
+        target="feishu_jie",
+        include_user_transcript=False,
+    )
     assert config.delivery_targets["feishu_jie"].to == "user:ou_env"
