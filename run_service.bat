@@ -7,9 +7,9 @@ echo  OpenClaw Voice Core - Windows
 echo ========================================
 echo.
 
-if not exist "config\default.yaml" (
-    echo [i] Creating local config\default.yaml from config\default.example.yaml
-    copy /Y "config\default.example.yaml" "config\default.yaml" >nul
+if not exist "config\local.yaml" (
+    echo [i] Creating local config\local.yaml from config\default.example.yaml
+    copy /Y "config\default.example.yaml" "config\local.yaml" >nul
 )
 
 if exist ".venv\Scripts\python.exe" (
@@ -18,7 +18,7 @@ if exist ".venv\Scripts\python.exe" (
     set "PYTHON=python"
 )
 
-"%PYTHON%" -m openclaw_voice_control --config config/default.yaml --env-file .env %*
+"%PYTHON%" -m openclaw_voice_control --config config/local.yaml --env-file .env %*
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" (
     echo.
