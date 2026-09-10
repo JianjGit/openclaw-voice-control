@@ -15,6 +15,41 @@ The current Voice Core requires **OpenClaw Gateway protocol v4**. During the `co
 
 A Gateway that only supports an older protocol version is not compatible with this client. Keep the OpenClaw Gateway installation updated to a version that supports protocol v4.
 
+## Gateway v4 agent reply stream
+
+After `chat.send` is accepted, its response supplies a `runId`. That ACK only means the run was accepted; it is not the assistant reply.
+
+Voice Core then follows `event.agent` frames for that exact run. The v4 shape used by the normal reply path is:
+
+```json
+{
+  "type": "event",
+  "event": "agent",
+  "payload": {
+    "runId": "...",
+    "seq": 1,
+    "stream": "assistant",
+    "ts": 0,
+    "data": {
+      "text": "cumulative assistant text",
+      "delta": "new text"
+    }
+  }
+}
+```
+
+For `stream="assistant"`, `data.text` is treated as the cumulative visible assistant snapshot and is fed into the existing `ResponseAccumulator`. Complete sentences are delivered in order through `on_sentence` without duplicate playback.
+
+Events whose `payload.runId` does not match the `chat.send` run are ignored. The run finishes when a matching agent event has `stream="lifecycle"` and `data.phase="end"` or `"error"`; any remaining unspoken tail is flushed and the method returns immediately instead of waiting for the overall response deadline.
+
+`data.output` remains accepted only as a legacy compatibility fallback. Protocol v4 normally uses `data.text`.
+
+The same-machine session JSONL reader remains available as a fallback, but it is not required for the normal Gateway v4 path. This matters when Voice Core and OpenClaw run on different machines or VMs and do not share the OpenClaw sessions directory.
+
+## Safe event diagnostics
+
+Gateway agent events may be logged at debug level using structure-only diagnostics. The log records event type/name, runId, payload/data field names and text length. It does **not** log auth tokens or full assistant/event text.
+
 ## Connection and response flow
 
 The client connects to the configured WS URL, completes the challenge/auth handshake, sends `chat.send`, and receives `event.agent` snapshots. It also polls the configured OpenClaw session directory as a fallback source for the final assistant message.
