@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -64,6 +65,45 @@ def test_be_t08_session_fallback_reads_current_assistant_message(tmp_path) -> No
     )
 
     assert snapshot == "fallback reply。"
+
+
+def test_be_t08_handshake_uses_gateway_protocol_v4(monkeypatch) -> None:
+    class FakeWS:
+        def __init__(self) -> None:
+            self.messages = [
+                json.dumps({"event": "connect.challenge"}),
+                json.dumps(
+                    {
+                        "ok": True,
+                        "payload": {"auth": {"scopes": ["operator.read", "operator.write"]}},
+                    }
+                ),
+            ]
+            self.sent: list[dict] = []
+
+        async def recv(self):
+            return self.messages.pop(0)
+
+        async def send(self, payload: str) -> None:
+            self.sent.append(json.loads(payload))
+
+    ws = FakeWS()
+
+    class FakeWebsockets:
+        @staticmethod
+        async def connect(*_args, **_kwargs):
+            return ws
+
+    monkeypatch.setitem(sys.modules, "websockets", FakeWebsockets())
+    gateway = GatewayWebSocket(_config())
+
+    asyncio.run(gateway._connect_async())
+
+    assert len(ws.sent) == 1
+    connect_request = ws.sent[0]
+    assert connect_request["method"] == "connect"
+    assert connect_request["params"]["minProtocol"] == 4
+    assert connect_request["params"]["maxProtocol"] == 4
 
 
 def test_be_t08_ack_wait_preserves_agent_event_order() -> None:
