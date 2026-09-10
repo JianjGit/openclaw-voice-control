@@ -249,6 +249,43 @@ def _validate_delivery_scalar(label: str, value: str) -> str:
     return normalized
 
 
+def _validate_delivery_to(label: str, channel: str, value: str) -> str:
+    normalized = _validate_delivery_scalar(label, value)
+
+    if channel == "discord":
+        # Match the Gateway Discord parser without guessing whether a bare numeric
+        # identifier is a user or channel. Human-readable channel names remain valid.
+        if re.fullmatch(r"(?:discord:)?(?:channel|user):\d+", normalized, re.IGNORECASE):
+            return normalized
+        if re.fullmatch(r"<@!?\d+>", normalized):
+            return normalized
+        if ":" not in normalized and not normalized.isdigit():
+            return normalized
+        raise ValueError(
+            f"{label} is not a valid Discord target; use channel:<id>, user:<id>, "
+            "a Discord mention, or an unambiguous channel name"
+        )
+
+    if channel == "feishu":
+        # Gateway Feishu accepts optional provider prefixes plus chat/group/channel,
+        # user/dm/open_id targets, and raw OpenClaw/User IDs composed of safe ID chars.
+        target = re.sub(r"^(?:feishu|lark):", "", normalized, flags=re.IGNORECASE).strip()
+        if re.fullmatch(
+            r"(?:chat|group|channel|user|dm|open_id):[A-Za-z0-9_-]+",
+            target,
+            re.IGNORECASE,
+        ):
+            return normalized
+        if re.fullmatch(r"[A-Za-z0-9_-]+", target):
+            return normalized
+        raise ValueError(
+            f"{label} is not a valid Feishu target; use user:<id>, open_id:<id>, "
+            "chat:<id>, group:<id>, channel:<id>, dm:<id>, or a raw Feishu ID"
+        )
+
+    raise ValueError(f"{label} uses unsupported delivery channel: {channel}")
+
+
 def _load_delivery_config(
     raw_delivery: Any,
     raw_targets: Any,
@@ -299,8 +336,9 @@ def _load_delivery_config(
             f"delivery_targets.{name}.account_id",
             _delivery_value(f"{env_prefix}_ACCOUNT_ID", raw_target.get("account_id"), "default"),
         )
-        to = _validate_delivery_scalar(
+        to = _validate_delivery_to(
             f"delivery_targets.{name}.to",
+            channel,
             _delivery_value(f"{env_prefix}_TO", raw_target.get("to")),
         )
         targets[name] = DeliveryTargetConfig(channel=channel, account_id=account_id, to=to)
