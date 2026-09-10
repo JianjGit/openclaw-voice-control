@@ -18,7 +18,7 @@ venv/
 !.env.example
 
 # Local runtime configuration
-config/default.yaml
+config/local.yaml
 config/*.local.yaml
 !config/default.example.yaml
 
