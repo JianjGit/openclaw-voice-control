@@ -38,6 +38,7 @@ def test_be_t10_kept_windows_tools_are_present() -> None:
         "scripts/test_microphone.py",
         "run_service.bat",
         "config/default.example.yaml",
+        "config/README.md",
     ]
     for relative in kept:
         assert (ROOT / relative).is_file(), relative
@@ -50,7 +51,7 @@ def test_be_t10_local_runtime_config_is_gitignored() -> None:
         if line.strip() and not line.lstrip().startswith("#")
     }
 
-    assert "config/default.yaml" in lines
+    assert "config/local.yaml" in lines
     assert "!config/default.example.yaml" in lines
 
 
