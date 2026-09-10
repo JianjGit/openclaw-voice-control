@@ -55,6 +55,14 @@ def test_be_t10_local_runtime_config_is_gitignored() -> None:
     assert "!config/default.example.yaml" in lines
 
 
+def test_be_t10_launcher_bootstraps_gitignored_local_config() -> None:
+    launcher = (ROOT / "run_service.bat").read_text(encoding="utf-8")
+
+    assert 'if not exist "config\\local.yaml"' in launcher
+    assert 'copy /Y "config\\default.example.yaml" "config\\local.yaml"' in launcher
+    assert "--config config/local.yaml" in launcher
+
+
 def test_be_t10_core_and_launchers_have_no_overlay_or_macos_runtime_chain() -> None:
     candidates = list((ROOT / "src" / "openclaw_voice_control").glob("*.py"))
     candidates += [ROOT / "pyproject.toml", ROOT / "requirements.txt", ROOT / "run_service.bat"]
