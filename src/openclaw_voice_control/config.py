@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +10,20 @@ import yaml
 
 
 ENV_PATTERN = re.compile(r"\$\{([^}]+)\}")
+_DELIVERY_TARGET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+_DELIVERY_MODES = frozenset({"off", "mirror"})
+_DELIVERY_CHANNELS = frozenset({"discord", "feishu"})
+_DELIVERY_FORBIDDEN_KEYS = frozenset(
+    {
+        "token",
+        "password",
+        "secret",
+        "app_secret",
+        "appsecret",
+        "client_secret",
+        "bot_token",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -19,6 +33,19 @@ class AppConfig:
     base_dir: Path
     log_dir: Path
     log_level: str
+
+
+@dataclass(slots=True, frozen=True)
+class DeliveryConfig:
+    mode: str = "off"
+    target: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class DeliveryTargetConfig:
+    channel: str
+    account_id: str
+    to: str
 
 
 @dataclass(slots=True)
@@ -31,6 +58,11 @@ class OpenClawConfig:
     home_dir: Path
     timeout_seconds: int = 120
     ws_timeout: int = 30
+    # Delivery is intentionally independent of session_key. These references live
+    # here so the Gateway client can mirror a completed reply without coupling the
+    # service layer to channel-specific credentials or SDKs.
+    delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
+    delivery_targets: dict[str, DeliveryTargetConfig] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -102,6 +134,14 @@ class VoiceControlConfig:
     tts: TTSConfig
     stt: STTConfig
     asr: ASRConfig
+
+    @property
+    def delivery(self) -> DeliveryConfig:
+        return self.openclaw.delivery
+
+    @property
+    def delivery_targets(self) -> dict[str, DeliveryTargetConfig]:
+        return self.openclaw.delivery_targets
 
 
 def load_env_file(path: str | Path | None) -> None:
@@ -189,6 +229,93 @@ def _int_env_or_config(env_key: str, configured_value: Any, default: int) -> int
     return int(default)
 
 
+def _delivery_value(env_key: str, configured_value: Any, default: str = "") -> str:
+    env_value = os.getenv(env_key)
+    if env_value is not None:
+        return env_value.strip()
+    if configured_value is None:
+        return default
+    if not isinstance(configured_value, str):
+        raise ValueError(f"{env_key} / delivery configuration value must be a string")
+    return configured_value.strip()
+
+
+def _validate_delivery_scalar(label: str, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{label} must not be empty")
+    if any(char in normalized for char in ("\r", "\n", "\x00")):
+        raise ValueError(f"{label} must be a single safe value")
+    return normalized
+
+
+def _load_delivery_config(
+    raw_delivery: Any,
+    raw_targets: Any,
+) -> tuple[DeliveryConfig, dict[str, DeliveryTargetConfig]]:
+    if raw_delivery is None:
+        raw_delivery = {}
+    if raw_targets is None:
+        raw_targets = {}
+    if not isinstance(raw_delivery, dict):
+        raise ValueError("delivery must be a mapping")
+    if not isinstance(raw_targets, dict):
+        raise ValueError("delivery_targets must be a mapping")
+
+    raw_mode = raw_delivery.get("mode")
+    # PyYAML follows YAML 1.1 booleans, where an unquoted `off` becomes False.
+    # Accept that exact representation so the documented `mode: off` works.
+    if raw_mode is False:
+        raw_mode = "off"
+    mode = _delivery_value("OPENCLAW_DELIVERY_MODE", raw_mode, "off").lower()
+    if mode not in _DELIVERY_MODES:
+        raise ValueError("delivery.mode must be one of: off, mirror")
+    selected_target = _delivery_value("OPENCLAW_DELIVERY_TARGET", raw_delivery.get("target"), "")
+
+    targets: dict[str, DeliveryTargetConfig] = {}
+    for raw_name, raw_target in raw_targets.items():
+        name = str(raw_name).strip()
+        if not name or not _DELIVERY_TARGET_NAME_PATTERN.fullmatch(name):
+            raise ValueError(
+                "delivery target names may contain only letters, numbers, and underscores"
+            )
+        if not isinstance(raw_target, dict):
+            raise ValueError(f"delivery_targets.{name} must be a mapping")
+        forbidden = _DELIVERY_FORBIDDEN_KEYS.intersection(str(key).lower() for key in raw_target)
+        if forbidden:
+            raise ValueError(
+                f"delivery_targets.{name} must not contain channel credentials; "
+                "configure credentials in OpenClaw Gateway"
+            )
+
+        env_prefix = f"OPENCLAW_DELIVERY_TARGET_{name.upper()}"
+        channel = _delivery_value(f"{env_prefix}_CHANNEL", raw_target.get("channel")).lower()
+        if channel not in _DELIVERY_CHANNELS:
+            allowed = ", ".join(sorted(_DELIVERY_CHANNELS))
+            raise ValueError(
+                f"delivery_targets.{name}.channel must be a supported external channel: {allowed}"
+            )
+        account_id = _validate_delivery_scalar(
+            f"delivery_targets.{name}.account_id",
+            _delivery_value(f"{env_prefix}_ACCOUNT_ID", raw_target.get("account_id"), "default"),
+        )
+        to = _validate_delivery_scalar(
+            f"delivery_targets.{name}.to",
+            _delivery_value(f"{env_prefix}_TO", raw_target.get("to")),
+        )
+        targets[name] = DeliveryTargetConfig(channel=channel, account_id=account_id, to=to)
+
+    if selected_target and selected_target not in targets:
+        raise ValueError(
+            f"delivery.target references unknown target '{selected_target}'; "
+            "it must name a preconfigured delivery_targets entry"
+        )
+    if mode == "mirror" and not selected_target:
+        raise ValueError("delivery.target is required when delivery.mode=mirror")
+
+    return DeliveryConfig(mode=mode, target=selected_target), targets
+
+
 def default_config_path() -> Path:
     env_path = os.getenv("VOICE_CONTROL_CONFIG")
     if env_path:
@@ -211,6 +338,10 @@ def load_config(config_path: str | Path | None = None, env_path: str | Path | No
     wakeword = data.get("wakeword", {})
     tts = data.get("tts", {})
     asr = data.get("asr", {})
+    delivery, delivery_targets = _load_delivery_config(
+        data.get("delivery", {}),
+        data.get("delivery_targets", {}),
+    )
 
     app_cfg = AppConfig(
         name=app.get("name", "openclaw-voice-control"),
@@ -261,6 +392,8 @@ def load_config(config_path: str | Path | None = None, env_path: str | Path | No
                 openclaw.get("ws_timeout"),
                 30,
             ),
+            delivery=delivery,
+            delivery_targets=delivery_targets,
         ),
         stt=STTConfig(
             host=_env_or_config("STT_HOST", stt.get("host"), "127.0.0.1"),
