@@ -174,6 +174,7 @@ class GatewayWebSocket:
             if msg.get("type") == "res" and msg.get("id") == str(expected_id):
                 return msg
             if msg.get("type") == "event":
+                self._log_event_shape(msg)
                 self._pending_events.append(msg)
         return None
 
@@ -216,9 +217,16 @@ class GatewayWebSocket:
 
         run_id = response.get("payload", {}).get("runId", "")
         log = self._get_logger()
+        if not isinstance(run_id, str) or not run_id:
+            log.warning("chat.send accepted without runId")
+            return ""
+
+        # protocol v4 chat.send returns an acceptance ACK. It is not the final
+        # assistant response; finality comes from the matching agent lifecycle.
         log.info("Chat sent, runId=%s", run_id)
         accumulator = ResponseAccumulator()
         stable_polls = 0
+        saw_matching_agent_event = False
         deadline = time.monotonic() + float(self.config.timeout_seconds)
         session_dir = self._session_dir()
 
@@ -232,14 +240,38 @@ class GatewayWebSocket:
                 events.append(event)
 
             for evt in events:
-                snapshot = self._agent_snapshot(evt, run_id)
-                if snapshot is None:
+                if not self._is_matching_agent_event(evt, run_id):
                     continue
-                before = accumulator.full_text
-                sentences = accumulator.feed_snapshot(snapshot)
-                changed = changed or accumulator.full_text != before
-                self._deliver_sentences(sentences, on_sentence)
 
+                saw_matching_agent_event = True
+                snapshot = self._agent_snapshot(evt, run_id)
+                if snapshot is not None:
+                    before = accumulator.full_text
+                    sentences = accumulator.feed_snapshot(snapshot)
+                    changed = changed or accumulator.full_text != before
+                    self._deliver_sentences(sentences, on_sentence)
+
+                terminal_phase = self._agent_terminal_phase(evt, run_id)
+                if terminal_phase is not None:
+                    remainder = accumulator.flush()
+                    if remainder and on_sentence is not None:
+                        on_sentence(remainder)
+                    if terminal_phase == "error":
+                        log.warning(
+                            "Gateway agent run ended with error | runId=%s text_len=%d",
+                            run_id,
+                            len(accumulator.full_text),
+                        )
+                    else:
+                        log.info(
+                            "Gateway agent run complete | runId=%s text_len=%d",
+                            run_id,
+                            len(accumulator.full_text),
+                        )
+                    return accumulator.full_text
+
+            # Keep the same-machine JSONL fallback for compatibility. It is not
+            # the normal v4 path and may not exist when Gateway runs elsewhere.
             session_snapshot = self._read_session_snapshot(
                 session_dir,
                 send_timestamp=send_timestamp,
@@ -251,7 +283,10 @@ class GatewayWebSocket:
                 changed = changed or accumulator.full_text != before
                 self._deliver_sentences(sentences, on_sentence)
 
-            if accumulator.full_text:
+            # Legacy fallback-only behavior can still finish after a stable
+            # session snapshot. Once a matching v4 agent event is seen, wait for
+            # that run's lifecycle end/error instead of guessing from silence.
+            if accumulator.full_text and not saw_matching_agent_event:
                 stable_polls = 0 if changed else stable_polls + 1
                 if stable_polls >= 3:
                     remainder = accumulator.flush()
@@ -261,7 +296,7 @@ class GatewayWebSocket:
 
             await asyncio.sleep(0.2)
 
-        log.warning("Response deadline reached")
+        log.warning("Response deadline reached | runId=%s text_len=%d", run_id, len(accumulator.full_text))
         remainder = accumulator.flush()
         if remainder and on_sentence is not None:
             on_sentence(remainder)
@@ -279,19 +314,83 @@ class GatewayWebSocket:
         except json.JSONDecodeError:
             return None
         if msg.get("type") == "event":
+            self._log_event_shape(msg)
             return msg
         return None
 
+    def _log_event_shape(self, event: dict[str, Any]) -> None:
+        if event.get("type") != "event" or event.get("event") != "agent":
+            return
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            self._get_logger().debug(
+                "Gateway event shape | type=%s event=%s runId=%s payload_keys=[] data_keys=[] text_len=0",
+                event.get("type"),
+                event.get("event"),
+                None,
+            )
+            return
+
+        data = payload.get("data")
+        data_keys = sorted(str(key) for key in data.keys()) if isinstance(data, dict) else []
+        text_len = 0
+        if isinstance(data, dict):
+            for key in ("text", "output", "delta"):
+                value = data.get(key)
+                if isinstance(value, str):
+                    text_len = max(text_len, len(value))
+
+        self._get_logger().debug(
+            "Gateway event shape | type=%s event=%s runId=%s payload_keys=%s data_keys=%s text_len=%d",
+            event.get("type"),
+            event.get("event"),
+            payload.get("runId"),
+            sorted(str(key) for key in payload.keys()),
+            data_keys,
+            text_len,
+        )
+
+    @staticmethod
+    def _is_matching_agent_event(event: dict[str, Any], run_id: str) -> bool:
+        if event.get("type") != "event" or event.get("event") != "agent":
+            return False
+        payload = event.get("payload")
+        return isinstance(payload, dict) and payload.get("runId") == run_id
+
     @staticmethod
     def _agent_snapshot(event: dict[str, Any], run_id: str) -> str | None:
-        if event.get("type") != "event" or event.get("event") != "agent":
+        if not GatewayWebSocket._is_matching_agent_event(event, run_id):
             return None
-        payload = event.get("payload", {})
-        if payload.get("runId") != run_id:
+        payload = event.get("payload")
+        assert isinstance(payload, dict)
+        if payload.get("stream") != "assistant":
             return None
-        data = payload.get("data", {})
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None
+
+        # Gateway protocol v4 assistant events carry the cumulative visible
+        # assistant snapshot in data.text. Keep data.output only as a legacy
+        # compatibility fallback; ResponseAccumulator still owns deduplication.
+        text = data.get("text")
+        if isinstance(text, str) and text:
+            return text
         output = data.get("output")
         return output if isinstance(output, str) and output else None
+
+    @staticmethod
+    def _agent_terminal_phase(event: dict[str, Any], run_id: str) -> str | None:
+        if not GatewayWebSocket._is_matching_agent_event(event, run_id):
+            return None
+        payload = event.get("payload")
+        assert isinstance(payload, dict)
+        if payload.get("stream") != "lifecycle":
+            return None
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None
+        phase = data.get("phase")
+        return phase if phase in {"end", "error"} else None
 
     @staticmethod
     def _deliver_sentences(
