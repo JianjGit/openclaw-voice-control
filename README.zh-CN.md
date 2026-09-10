@@ -14,7 +14,7 @@ OpenClaw Voice Control 把 Windows 机器变成可复用的语音能力层：支
 - 麦克风录音与静音自动结束判断。
 - 本地 SenseVoice / FunASR 语音识别。
 - 本地 `POST /stt` 文件识别 HTTP 接口。
-- OpenClaw Gateway WebSocket 对话，并保留 session fallback。
+- OpenClaw Gateway protocol v4 WebSocket 对话，并保留 session fallback。
 - 流式回复按句进入 Windows SAPI5 TTS。
 - FIFO 朗读队列，支持停止与关闭。
 - Python SDK：语音输入、文本对话、音频文件识别、主动朗读、生命周期控制。
@@ -27,7 +27,7 @@ OpenClaw Voice Control 把 Windows 机器变成可复用的语音能力层：支
 
 - Windows
 - Python 3.11+
-- 可访问的 OpenClaw Gateway
+- 可访问且支持 **protocol v4** 的 OpenClaw Gateway
 - 本地 SenseVoice 模型文件
 - 需要语音输入时使用麦克风
 
@@ -204,7 +204,7 @@ service.close()                                       # 幂等关闭
 - **Wakeword：** openWakeWord，可选 Porcupine
 - **Audio：** `sounddevice` + NumPy
 - **ASR：** FunASR + SenseVoice
-- **对话：** OpenClaw Gateway WebSocket + session JSONL fallback
+- **对话：** OpenClaw Gateway protocol v4 WebSocket + session JSONL fallback
 - **TTS：** Windows SAPI5
 - **并发控制：** Python thread、lock、condition、queue、runtime event
 - **外部接入：** 框架无关的 `VoiceEvent` / `Presenter`
@@ -269,7 +269,7 @@ docs/
 │  ├─ wakeword.md          # 唤醒词 provider 与生命周期
 │  ├─ record.md            # 麦克风录音与静音判断
 │  ├─ asr.md               # SenseVoice / FunASR
-│  ├─ gateway-ws.md        # OpenClaw WebSocket 与回复聚合
+│  ├─ gateway-ws.md        # OpenClaw Gateway protocol v4、WebSocket 与回复聚合
 │  ├─ tts.md               # Windows TTS 与 SpeechController
 │  └─ events-and-text.md   # VoiceEvent 协议与文本清理
 │
@@ -322,6 +322,6 @@ error
 python -m pytest -q
 ```
 
-自动化测试覆盖事件、RuntimeControl、朗读队列、ASR 串行化、STT HTTP、`listen_once()`、运行时输入模式切换、文本对话、主动朗读、wakeword 编排、Gateway 聚合/去重、配置，以及外部 Presenter/API 集成。
+自动化测试覆盖事件、RuntimeControl、朗读队列、ASR 串行化、STT HTTP、`listen_once()`、运行时输入模式切换、文本对话、主动朗读、wakeword 编排、Gateway protocol v4 握手/聚合/去重、配置，以及外部 Presenter/API 集成。
 
 真实硬件验证见 [`docs/same-machine-test.md`](docs/same-machine-test.md)。
