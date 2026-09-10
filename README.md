@@ -40,9 +40,10 @@ py -3.11 -m venv .venv
 python -m pip install --upgrade pip
 pip install -e ".[dev]"
 copy .env.example .env
+copy config\default.example.yaml config\local.yaml
 ```
 
-Edit `.env` and configure at least the OpenClaw token and local ASR model paths. Default runtime settings live in [`config/default.yaml`](config/default.yaml).
+Edit `.env` and `config/local.yaml` for machine-specific settings. `config/local.yaml` is intentionally ignored by Git, so local endpoint, delivery-target, audio-device and wakeword changes do not block future pulls. The tracked template is [`config/default.example.yaml`](config/default.example.yaml); `run_service.bat` creates `config/local.yaml` from it automatically when the local file is missing. See [`config/README.md`](config/README.md) for migration notes.
 
 Optional routes:
 
@@ -62,7 +63,7 @@ pip install -e ".[tts-cli]"     # optional edge-tts/comtypes helpers for tts_cli
 or:
 
 ```powershell
-python -m openclaw_voice_control --config config/default.yaml --env-file .env
+python -m openclaw_voice_control --config config/local.yaml --env-file .env
 ```
 
 `run()` loads the core once and keeps the same ASR, Gateway, TTS, STT server and service instance alive.
@@ -228,7 +229,7 @@ from openclaw_voice_control import NullPresenter, VoiceControlService
 from openclaw_voice_control.config import load_config
 
 service = VoiceControlService(
-    load_config("config/default.yaml", ".env"),
+    load_config("config/local.yaml", ".env"),
     presenter=NullPresenter(),
 )
 
@@ -296,7 +297,7 @@ More details: [`docs/architecture.md`](docs/architecture.md).
 
 ```text
 openclaw-voice-control/
-├─ config/       # default runtime configuration
+├─ config/       # tracked template + gitignored local runtime configuration
 ├─ docs/         # architecture, module, integration and validation docs
 ├─ examples/     # external-consumer examples
 ├─ scripts/      # TTS/STT/audio diagnostic utilities
