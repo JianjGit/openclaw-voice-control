@@ -106,6 +106,86 @@ def test_be_t08_handshake_uses_gateway_protocol_v4(monkeypatch) -> None:
     assert connect_request["params"]["maxProtocol"] == 4
 
 
+def test_be_t08_v4_agent_events_stream_assistant_text_and_finish_on_lifecycle(tmp_path) -> None:
+    run_id = "run-voice-1"
+
+    def agent_event(event_run_id: str, seq: int, stream: str, data: dict) -> str:
+        return json.dumps(
+            {
+                "type": "event",
+                "event": "agent",
+                "payload": {
+                    "runId": event_run_id,
+                    "seq": seq,
+                    "stream": stream,
+                    "ts": 1_700_000_000_000 + seq,
+                    "data": data,
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.messages = [
+                json.dumps(
+                    {
+                        "type": "res",
+                        "id": "1",
+                        "ok": True,
+                        "payload": {"status": "accepted", "runId": run_id},
+                    }
+                ),
+                agent_event("other-run", 1, "assistant", {"text": "这句绝不能串进来。"}),
+                agent_event(run_id, 1, "assistant", {"text": "你好，旅行者。", "delta": "你好，旅行者。"}),
+                agent_event(
+                    run_id,
+                    2,
+                    "assistant",
+                    {"text": "你好，旅行者。今天风很舒服。", "delta": "今天风很舒服。"},
+                ),
+                agent_event(run_id, 3, "lifecycle", {"phase": "end"}),
+            ]
+            self.sent: list[dict] = []
+
+        async def recv(self):
+            return self.messages.pop(0)
+
+        async def send(self, payload: str) -> None:
+            self.sent.append(json.loads(payload))
+
+    ws = FakeWS()
+    gateway = GatewayWebSocket(
+        _config(home_dir=tmp_path, timeout_seconds=3, ws_timeout=1)
+    )
+    gateway._ws = ws
+    callbacks: list[str] = []
+
+    result = asyncio.run(gateway._chat_send_streaming_async("你好", callbacks.append))
+
+    assert ws.sent[0]["method"] == "chat.send"
+    assert result == "你好，旅行者。今天风很舒服。"
+    assert callbacks == ["你好，旅行者。", "今天风很舒服。"]
+    assert "这句绝不能串进来。" not in result
+
+
+def test_be_t08_v4_agent_snapshot_uses_text_and_filters_unrelated_run() -> None:
+    event = {
+        "type": "event",
+        "event": "agent",
+        "payload": {
+            "runId": "run-1",
+            "seq": 2,
+            "stream": "assistant",
+            "ts": 123,
+            "data": {"text": "累计回复。", "delta": "回复。"},
+        },
+    }
+
+    assert GatewayWebSocket._agent_snapshot(event, "run-1") == "累计回复。"
+    assert GatewayWebSocket._agent_snapshot(event, "run-2") is None
+
+
 def test_be_t08_ack_wait_preserves_agent_event_order() -> None:
     class FakeWS:
         def __init__(self) -> None:
