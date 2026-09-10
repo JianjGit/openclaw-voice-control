@@ -39,6 +39,7 @@ class AppConfig:
 class DeliveryConfig:
     mode: str = "off"
     target: str = ""
+    include_user_transcript: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -240,6 +241,22 @@ def _delivery_value(env_key: str, configured_value: Any, default: str = "") -> s
     return configured_value.strip()
 
 
+def _delivery_bool(env_key: str, configured_value: Any, default: bool = False) -> bool:
+    env_value = os.getenv(env_key)
+    if env_value is not None:
+        normalized = env_value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+        raise ValueError(f"{env_key} must be true or false")
+    if configured_value is None:
+        return default
+    if isinstance(configured_value, bool):
+        return configured_value
+    raise ValueError("delivery.include_user_transcript must be a boolean true or false")
+
+
 def _validate_delivery_scalar(label: str, value: str) -> str:
     normalized = value.strip()
     if not normalized:
@@ -308,6 +325,11 @@ def _load_delivery_config(
     if mode not in _DELIVERY_MODES:
         raise ValueError("delivery.mode must be one of: off, mirror")
     selected_target = _delivery_value("OPENCLAW_DELIVERY_TARGET", raw_delivery.get("target"), "")
+    include_user_transcript = _delivery_bool(
+        "OPENCLAW_DELIVERY_INCLUDE_USER_TRANSCRIPT",
+        raw_delivery.get("include_user_transcript"),
+        False,
+    )
 
     targets: dict[str, DeliveryTargetConfig] = {}
     for raw_name, raw_target in raw_targets.items():
@@ -351,7 +373,11 @@ def _load_delivery_config(
     if mode == "mirror" and not selected_target:
         raise ValueError("delivery.target is required when delivery.mode=mirror")
 
-    return DeliveryConfig(mode=mode, target=selected_target), targets
+    return DeliveryConfig(
+        mode=mode,
+        target=selected_target,
+        include_user_transcript=include_user_transcript,
+    ), targets
 
 
 def default_config_path() -> Path:

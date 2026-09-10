@@ -15,7 +15,7 @@ OpenClaw Voice Control turns a Windows machine into a reusable voice layer: wake
 - Local SenseVoice / FunASR speech recognition.
 - Local `POST /stt` HTTP endpoint for file transcription.
 - OpenClaw Gateway protocol v4 conversation over WebSocket with session fallback.
-- Optional, default-off mirroring of final assistant replies to preconfigured Feishu or Discord targets through OpenClaw Gateway.
+- Optional, default-off mirroring of final assistant replies or the full user-transcript/assistant exchange to preconfigured Feishu or Discord targets through OpenClaw Gateway.
 - Streaming sentence-by-sentence TTS through Windows SAPI5.
 - FIFO speech queue with stop / shutdown control.
 - Public Python SDK for voice input, text chat, transcription and active speech.
@@ -82,7 +82,7 @@ wakeword
 
 ### Optional mirror delivery
 
-Assistant-reply delivery is separate from conversation routing. `OPENCLAW_SESSION_KEY` continues to select the agent/session/context that answers the voice turn. It does not select an IM recipient.
+Mirror delivery is separate from conversation routing. `OPENCLAW_SESSION_KEY` continues to select the agent/session/context that answers the voice turn. It never selects an IM recipient.
 
 Mirror delivery is disabled by default, so the existing local display/TTS behavior does not produce any external message:
 
@@ -90,6 +90,7 @@ Mirror delivery is disabled by default, so the existing local display/TTS behavi
 delivery:
   mode: off
   target: ""
+  include_user_transcript: false
 ```
 
 To allow delivery, declare destinations under `delivery_targets` and select one by name:
@@ -98,6 +99,7 @@ To allow delivery, declare destinations under `delivery_targets` and select one 
 delivery:
   mode: mirror
   target: feishu_jie
+  include_user_transcript: false
 
 delivery_targets:
   feishu_jie:
@@ -111,19 +113,28 @@ delivery_targets:
     to: channel:123456789012345678
 ```
 
-Only names already declared in `delivery_targets` can be selected. Voice transcripts and model replies are never interpreted as delivery targets. The current Voice Core allowlist supports `feishu` and `discord`; unsupported channels, unknown targets, empty destinations, and credential fields fail configuration loading before the service starts.
+`include_user_transcript` defaults to `false` for backward compatibility. With the default, only the final assistant reply is mirrored once. When set to `true`, Voice Core first mirrors the recognized user transcript, then performs the normal single `chat.send`, then mirrors the final assistant reply once. It does not submit the transcript through a second `chat.send` and does not request the model twice.
 
-Environment variables can override the mode, selected name, or fields of a target that is already declared in YAML:
+Enabling `include_user_transcript` is privacy-sensitive: recognized speech that would otherwise remain in the OpenClaw conversation/local voice flow is also sent to the selected external target. Only names already declared in `delivery_targets` can be selected. Voice transcripts, model replies and other user input are never interpreted as target names or destinations.
+
+Environment variables can override the mode, selected name, transcript option, or fields of a target that is already declared in YAML:
 
 ```dotenv
 OPENCLAW_DELIVERY_MODE=mirror
 OPENCLAW_DELIVERY_TARGET=feishu_jie
+OPENCLAW_DELIVERY_INCLUDE_USER_TRANSCRIPT=true
 OPENCLAW_DELIVERY_TARGET_FEISHU_JIE_CHANNEL=feishu
 OPENCLAW_DELIVERY_TARGET_FEISHU_JIE_ACCOUNT_ID=default
 OPENCLAW_DELIVERY_TARGET_FEISHU_JIE_TO=user:ou_84727a25ab32163de1ebd612aca75627
 ```
 
-Delivery happens only after the final assistant reply has been collected. Voice Core uses the Gateway protocol v4 `send` RPC with one idempotency key and does not request the model again. A delivery error is best-effort: it is logged without the reply body, destination value, token, or provider secret, while the original reply and local TTS continue normally.
+`OPENCLAW_DELIVERY_INCLUDE_USER_TRANSCRIPT` accepts only `true` or `false`. Unsupported channels, unknown targets, empty destinations, invalid booleans and credential fields fail configuration loading before the service starts.
+
+Gateway v4's official `send` request has no message-role, sender-type or arbitrary metadata field. Voice Core therefore does not invent protocol fields. User transcripts use the centralized text format `语音：「…」` so they are distinguishable in Feishu/Discord; assistant replies remain unchanged with no mechanical `assistant:` prefix.
+
+User-transcript and assistant-reply mirror sends receive independent idempotency keys, generated once per logical mirrored message. Streaming sentence callbacks never trigger delivery. Voice Core does not automatically retry mirror sends; any retry in the same logical send path must reuse its existing idempotency key so Gateway-side idempotency can prevent duplicate IM messages.
+
+Both mirror sends are best-effort. A user-transcript delivery failure does not block the normal `chat.send`, reply generation, local display or TTS, and an assistant delivery failure does not change the returned reply or local speech. Delivery logs contain only `kind=user_transcript|assistant_reply`, target name, channel and success status; they do not include reply/transcript text, destination values, tokens or provider error/secret details.
 
 Channel credentials such as Feishu app secrets or Discord bot tokens must remain in the OpenClaw Gateway configuration. Do not put them in `delivery_targets` or on the desktop-pet side. Dashboard/WebChat is an internal conversation surface rather than a generic outbound channel; it sees the shared session history through the normal session, and is deliberately not accepted as a mirror target.
 
@@ -370,6 +381,6 @@ See [`scripts/README.md`](scripts/README.md).
 python -m pytest -q
 ```
 
-Automated coverage includes events, runtime control, speech queue semantics, ASR serialization, STT HTTP, `listen_once()`, runtime input-mode switching, text conversation, active speech, wakeword orchestration, Gateway protocol v4 handshake/aggregation/deduplication, optional mirror delivery, configuration and external Presenter/API integration.
+Automated coverage includes events, runtime control, speech queue semantics, ASR serialization, STT HTTP, `listen_once()`, runtime input-mode switching, text conversation, active speech, wakeword orchestration, Gateway protocol v4 handshake/aggregation/deduplication, optional assistant-only/full-conversation mirror delivery, configuration and external Presenter/API integration.
 
 Hardware-dependent validation is documented in [`docs/same-machine-test.md`](docs/same-machine-test.md).
