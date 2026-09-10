@@ -13,6 +13,23 @@ openclaw:
   timeout_seconds: 120
   ws_timeout: 30
 
+# Final assistant replies stay local unless mirror delivery is explicitly enabled.
+delivery:
+  mode: off
+  target: ""
+
+# Preconfigured delivery allowlist. Channel credentials belong in OpenClaw Gateway,
+# never in Voice Core. Uncomment and edit only the targets you intend to allow.
+delivery_targets:
+  # feishu_jie:
+  #   channel: feishu
+  #   account_id: default
+  #   to: user:ou_84727a25ab32163de1ebd612aca75627
+  # discord_home:
+  #   channel: discord
+  #   account_id: default
+  #   to: channel:123456789012345678
+
 stt:
   host: 127.0.0.1
   port: 15900
