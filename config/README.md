@@ -18,13 +18,27 @@ The environment template points `VOICE_CONTROL_CONFIG` at `config/local.yaml`.
 
 ## Migrating an existing clone
 
-Older clones may already have local edits in the tracked `config/default.yaml`. After pulling the migration commit, copy those settings once into the ignored local file and restore the tracked legacy file:
+Older clones may already have local edits in the tracked `config/default.yaml`. The legacy file is intentionally frozen at the pre-migration template so a clone still based on commit `9328ae6` can pull this migration without a new net remote change to that path.
+
+After pulling, move your machine-specific values into the ignored local file and restore the tracked legacy file once:
 
 ```powershell
 copy config\default.yaml config\local.yaml
 git restore config/default.yaml
 ```
 
-Review `config/local.yaml` after copying. From then on, edit `config/local.yaml`, not `config/default.yaml`.
+If your existing `.env` contains this old setting:
 
-`config/default.yaml` is retained temporarily for backward compatibility with older scripts and clones, but new runtime usage should use `config/local.yaml`. New template changes belong in `config/default.example.yaml`.
+```dotenv
+VOICE_CONTROL_CONFIG=config/default.yaml
+```
+
+change it to:
+
+```dotenv
+VOICE_CONTROL_CONFIG=config/local.yaml
+```
+
+`run_service.bat` explicitly uses `config/local.yaml`, so the launcher is safe even before that `.env` line is updated. Review `config/local.yaml` after copying. From then on, edit `config/local.yaml`, not `config/default.yaml`.
+
+`config/default.yaml` is retained temporarily and frozen for backward compatibility with older scripts and clones. New runtime usage should use `config/local.yaml`, and future template changes belong only in `config/default.example.yaml`.
