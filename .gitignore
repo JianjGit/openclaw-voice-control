@@ -17,6 +17,11 @@ venv/
 .env.*.local
 !.env.example
 
+# Local runtime configuration
+config/local.yaml
+config/*.local.yaml
+!config/default.example.yaml
+
 # Runtime artifacts
 logs/
 runtime/

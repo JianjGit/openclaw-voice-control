@@ -1,3 +1,7 @@
+# Tracked configuration template.
+# Copy this file to config/local.yaml for local runtime use.
+# config/local.yaml is intentionally gitignored so local settings never block git pull.
+
 app:
   name: openclaw-voice-control
   platform: windows
@@ -17,6 +21,9 @@ openclaw:
 delivery:
   mode: off
   target: ""
+  # Privacy-sensitive opt-in. When true, recognized user speech is sent to the
+  # selected preconfigured delivery target before the normal chat.send request.
+  include_user_transcript: false
 
 # Preconfigured delivery allowlist. Channel credentials belong in OpenClaw Gateway,
 # never in Voice Core. Uncomment and edit only the targets you intend to allow.

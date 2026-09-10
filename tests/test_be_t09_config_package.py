@@ -95,9 +95,9 @@ def test_be_t09_pyproject_matches_actual_headless_dependencies() -> None:
     assert "openclaw-overlay" not in scripts
 
 
-def test_be_t09_default_yaml_has_no_overlay_or_macos_paths() -> None:
+def test_be_t09_default_example_yaml_has_no_overlay_or_macos_paths() -> None:
     root = Path(__file__).resolve().parents[1]
-    text = (root / "config" / "default.yaml").read_text(encoding="utf-8")
+    text = (root / "config" / "default.example.yaml").read_text(encoding="utf-8")
 
     assert "overlay:" not in text
     assert "/System/Library/" not in text

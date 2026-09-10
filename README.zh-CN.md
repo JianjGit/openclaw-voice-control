@@ -39,9 +39,10 @@ py -3.11 -m venv .venv
 python -m pip install --upgrade pip
 pip install -e ".[dev]"
 copy .env.example .env
+copy config\default.example.yaml config\local.yaml
 ```
 
-编辑 `.env`，至少配置 OpenClaw token，以及实际使用的本地 ASR 模型路径。默认运行配置在 [`config/default.yaml`](config/default.yaml)。
+编辑 `.env` 和 `config/local.yaml` 保存本机设置。`config/local.yaml` 已加入 `.gitignore`，所以 Gateway 地址、镜像目标、音频设备、唤醒词等本地改动不会再阻塞后续 `git pull`。仓库跟踪的模板是 [`config/default.example.yaml`](config/default.example.yaml)；如果本地文件不存在，`run_service.bat` 会自动从模板生成。旧仓库迁移方式见 [`config/README.md`](config/README.md)。
 
 可选依赖：
 
@@ -61,7 +62,7 @@ pip install -e ".[tts-cli]"     # tts_cli.py 的可选 edge-tts/comtypes 路线
 或：
 
 ```powershell
-python -m openclaw_voice_control --config config/default.yaml --env-file .env
+python -m openclaw_voice_control --config config/local.yaml --env-file .env
 ```
 
 `run()` 只加载一次核心能力，之后同一个 ASR、Gateway、TTS、STT server 和 `VoiceControlService` 实例持续存在。
@@ -169,7 +170,7 @@ from openclaw_voice_control import NullPresenter, VoiceControlService
 from openclaw_voice_control.config import load_config
 
 service = VoiceControlService(
-    load_config("config/default.yaml", ".env"),
+    load_config("config/local.yaml", ".env"),
     presenter=NullPresenter(),
 )
 
@@ -237,7 +238,7 @@ VoiceControlService（常驻）
 
 ```text
 openclaw-voice-control/
-├─ config/       # 默认运行配置
+├─ config/       # 受 Git 跟踪的模板 + 被忽略的本地运行配置
 ├─ docs/         # 架构、模块、接入、测试与设计文档
 ├─ examples/     # 外部消费方示例
 ├─ scripts/      # TTS/STT/音频诊断工具
