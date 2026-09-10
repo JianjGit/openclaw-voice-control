@@ -2,6 +2,21 @@
 
 `gateway_ws.py` implements the OpenClaw Gateway transport used by `openclaw_client.py`.
 
+## Protocol requirement
+
+The current Voice Core requires **OpenClaw Gateway protocol v4**. During the `connect` handshake it sends:
+
+```json
+{
+  "minProtocol": 4,
+  "maxProtocol": 4
+}
+```
+
+A Gateway that only supports an older protocol version is not compatible with this client. Keep the OpenClaw Gateway installation updated to a version that supports protocol v4.
+
+## Connection and response flow
+
 The client connects to the configured WS URL, completes the challenge/auth handshake, sends `chat.send`, and receives `event.agent` snapshots. It also polls the configured OpenClaw session directory as a fallback source for the final assistant message.
 
 Both sources feed one response accumulator. A source may only advance the known text; already-seen prefixes are ignored. Complete sentences are delivered synchronously and in order to the caller callback, so the speech layer does not receive duplicate sentences and no per-sentence callback threads are created.
