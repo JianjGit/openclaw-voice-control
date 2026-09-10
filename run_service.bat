@@ -7,6 +7,11 @@ echo  OpenClaw Voice Core - Windows
 echo ========================================
 echo.
 
+if not exist "config\default.yaml" (
+    echo [i] Creating local config\default.yaml from config\default.example.yaml
+    copy /Y "config\default.example.yaml" "config\default.yaml" >nul
+)
+
 if exist ".venv\Scripts\python.exe" (
     set "PYTHON=.venv\Scripts\python.exe"
 ) else (
