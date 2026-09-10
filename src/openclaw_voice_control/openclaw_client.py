@@ -48,7 +48,7 @@ class OpenClawClient:
         if (
             delivery is None
             or delivery.mode != "mirror"
-            or not delivery.include_user_transcript
+            or not getattr(delivery, "include_user_transcript", False)
             or not user_text
         ):
             return
