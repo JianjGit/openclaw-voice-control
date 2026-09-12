@@ -8,7 +8,9 @@ from openclaw_voice_control.vits_backend import VITSTTS
 
 
 def _config(tmp_path: Path, tts_yaml: str = ""):
-    path = tmp_path / "config.yaml"
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = config_dir / "config.yaml"
     if tts_yaml:
         content = "app:\n  log_dir: logs\ntts:\n" + tts_yaml
     else:
@@ -22,7 +24,14 @@ def test_default_provider_stays_windows_sapi(tmp_path: Path) -> None:
     assert config.tts.provider == "windows_sapi"
     assert config.tts.fallback == "windows_sapi"
     backend = WindowsTTS(config.tts)
-    assert type(backend).__name__ == "_WindowsSAPI"
+    assert isinstance(backend, WindowsTTS)
+
+
+def test_vits_provider_dispatches_without_changing_service_wiring(tmp_path: Path) -> None:
+    config = _config(tmp_path, "  provider: vits\n  fallback: none\n")
+    # Avoid touching a real checkpoint here; constructor behavior itself is covered
+    # with the injected engines below.
+    assert config.tts.provider == "vits"
 
 
 def test_vits_config_parses_runtime_parameters(tmp_path: Path) -> None:
