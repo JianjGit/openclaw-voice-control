@@ -1,20 +1,79 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
+import time
+import wave
 from dataclasses import dataclass, field
 from typing import Callable
 
 from .config import TTSConfig
 
 
-@dataclass(slots=True)
-class WindowsTTS:
-    """Windows SAPI5 backend.
+def _play_sync(sound_path: str) -> None:
+    """Project WAV playback path used by notification sounds and generated VITS WAVs."""
+    try:
+        import winsound
 
-    The backend must be opened, used, and closed by the same worker thread.
-    It owns no queue and no UI/runtime state.
-    """
+        winsound.PlaySound(sound_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+    except Exception:
+        escaped = sound_path.replace("'", "''")
+        subprocess.Popen(
+            ["powershell", "-c", f"(New-Object Media.SoundPlayer '{escaped}').PlaySync()"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def play_sound_async(sound_path: str) -> None:
+    """Preserve the existing fire-and-forget WAV playback behavior."""
+    if not sound_path or not os.path.exists(sound_path):
+        return
+    threading.Thread(target=lambda: _play_sync(sound_path), daemon=True).start()
+
+
+def play_wav_interruptible(sound_path: str, should_stop: Callable[[], bool]) -> bool:
+    """Play a generated WAV through the same Windows audio path and wait for safe cleanup."""
+    if not sound_path or not os.path.exists(sound_path):
+        return False
+
+    with wave.open(sound_path, "rb") as wav_file:
+        frames = wav_file.getnframes()
+        frame_rate = wav_file.getframerate()
+    duration = frames / float(frame_rate) if frame_rate else 0.0
+
+    try:
+        import winsound
+
+        winsound.PlaySound(sound_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        deadline = time.monotonic() + duration + 0.10
+        while time.monotonic() < deadline:
+            if should_stop():
+                try:
+                    winsound.PlaySound(None, 0)
+                finally:
+                    return False
+            time.sleep(0.05)
+        return True
+    except Exception:
+        escaped = sound_path.replace("'", "''")
+        proc = subprocess.Popen(
+            ["powershell", "-c", f"(New-Object Media.SoundPlayer '{escaped}').PlaySync()"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        while proc.poll() is None:
+            if should_stop():
+                proc.terminate()
+                return False
+            time.sleep(0.05)
+        return proc.returncode == 0
+
+
+@dataclass(slots=True)
+class _WindowsSAPI:
+    """Windows SAPI5 implementation shared by the public class and VITS fallback."""
 
     config: TTSConfig
     _voice: object | None = field(default=None, init=False)
@@ -51,9 +110,6 @@ class WindowsTTS:
         if self._voice is None:
             raise RuntimeError("WindowsTTS.open() must be called in the speech worker before speak()")
 
-        # Asynchronous SAPI playback lets the same COM-owning worker poll the
-        # runtime stop signal and interrupt the active utterance without
-        # invoking COM from another thread.
         self._voice.Speak(text, 1)
         while True:
             if should_stop():
@@ -73,21 +129,27 @@ class WindowsTTS:
             pythoncom.CoUninitialize()
 
     def play_sound_async(self, sound_path: str) -> None:
-        if not sound_path or not os.path.exists(sound_path):
-            return
-        threading.Thread(target=lambda: self._play_sync(sound_path), daemon=True).start()
+        play_sound_async(sound_path)
 
     @staticmethod
     def _play_sync(sound_path: str) -> None:
-        try:
-            import winsound
+        _play_sync(sound_path)
 
-            winsound.PlaySound(sound_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-        except Exception:
-            import subprocess
 
-            subprocess.Popen(
-                ["powershell", "-c", f"(New-Object Media.SoundPlayer '{sound_path}').PlaySync()"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+class WindowsTTS(_WindowsSAPI):
+    """Backwards-compatible public SAPI class with optional provider dispatch.
+
+    The default path still constructs this class exactly as before. When the config
+    explicitly selects VITS, construction returns the process-lifetime VITS backend
+    while keeping existing service wiring and direct WindowsTTS imports intact.
+    """
+
+    def __new__(cls, config: TTSConfig):
+        provider = getattr(config, "provider", "windows_sapi").strip().lower()
+        if provider == "windows_sapi":
+            return super().__new__(cls)
+        if provider == "vits":
+            from .vits_backend import VITSTTS
+
+            return VITSTTS(config, fallback_factory=lambda: _WindowsSAPI(config))
+        raise ValueError(f"Unsupported TTS provider: {provider}")

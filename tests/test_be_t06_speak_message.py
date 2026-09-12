@@ -55,13 +55,14 @@ def test_be_t06_speak_message_emits_speaking_idle_and_metadata() -> None:
         wait=True,
     )
 
-    assert backend.spoken == ["hello"]
+    # clean_text_for_tts() in dev intentionally terminates non-empty speech with `。`.
+    assert backend.spoken == ["hello。"]
     assert [event.kind for event in service.events] == [
         VoiceEventKind.SPEAKING,
         VoiceEventKind.IDLE,
     ]
     assert all(event.metadata["source"] == "external" for event in service.events)
-    assert service.events[0].text == "hello"
+    assert service.events[0].text == "hello。"
     service.speech.close()
 
 
@@ -73,7 +74,7 @@ def test_be_t06_wait_false_keeps_fifo_without_gateway_dependencies() -> None:
     service.speak_message("second", metadata={"message_id": "2"}, wait=False)
     assert service.speech.wait_done(1.0)
 
-    assert backend.spoken == ["first", "second"]
+    assert backend.spoken == ["first。", "second。"]
     assert [event.kind for event in service.events] == [
         VoiceEventKind.SPEAKING,
         VoiceEventKind.IDLE,
