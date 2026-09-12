@@ -196,13 +196,14 @@ class ClassicVITSEngine:
 
         hps = self._hps
         cleaners = list(hps.data.text_cleaners)
-        frontend_text = text
+        # Match the requested Space's app.py preprocessing before adding language tags.
+        frontend_text = text.replace("\n", " ").replace("\r", "").replace(" ", "")
         if "zh_ja_mixture_cleaners" in cleaners:
             language = self.config.language.strip().lower()
             if language in {"zh", "zh-cn", "chinese"}:
-                frontend_text = f"[ZH]{text}[ZH]"
+                frontend_text = f"[ZH]{frontend_text}[ZH]"
             elif language in {"ja", "jp", "japanese"}:
-                frontend_text = f"[JA]{text}[JA]"
+                frontend_text = f"[JA]{frontend_text}[JA]"
 
         sequence, cleaned = self._text_to_sequence(frontend_text, hps.symbols, cleaners)
         if getattr(hps.data, "add_blank", False):
