@@ -6,7 +6,7 @@ import threading
 import time
 import wave
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Callable
 
 from .config import TTSConfig
 
@@ -73,12 +73,7 @@ def play_wav_interruptible(sound_path: str, should_stop: Callable[[], bool]) -> 
 
 @dataclass(slots=True)
 class _WindowsSAPI:
-    """Windows SAPI5 backend.
-
-    The backend must be opened, used, and closed by the same worker thread.
-    It owns no queue and no UI/runtime state. This is the original Windows SAPI
-    behavior, kept separate so VITS can use it as a safe fallback.
-    """
+    """Windows SAPI5 implementation shared by the public class and VITS fallback."""
 
     config: TTSConfig
     _voice: object | None = field(default=None, init=False)
@@ -115,9 +110,6 @@ class _WindowsSAPI:
         if self._voice is None:
             raise RuntimeError("WindowsTTS.open() must be called in the speech worker before speak()")
 
-        # Asynchronous SAPI playback lets the same COM-owning worker poll the
-        # runtime stop signal and interrupt the active utterance without
-        # invoking COM from another thread.
         self._voice.Speak(text, 1)
         while True:
             if should_stop():
@@ -144,19 +136,20 @@ class _WindowsSAPI:
         _play_sync(sound_path)
 
 
-def WindowsTTS(config: TTSConfig) -> Any:
-    """Build the configured TTS backend without changing VoiceControlService wiring.
+class WindowsTTS(_WindowsSAPI):
+    """Backwards-compatible public SAPI class with optional provider dispatch.
 
-    Existing/default configurations still receive the original SAPI backend. VITS
-    configurations receive a process-lifetime VITS backend whose constructor loads
-    the model once; SAPI is retained only as the optional fallback.
+    The default path still constructs this class exactly as before. When the config
+    explicitly selects VITS, construction returns the process-lifetime VITS backend
+    while keeping existing service wiring and direct WindowsTTS imports intact.
     """
 
-    provider = getattr(config, "provider", "windows_sapi").strip().lower()
-    if provider == "windows_sapi":
-        return _WindowsSAPI(config)
-    if provider == "vits":
-        from .vits_backend import VITSTTS
+    def __new__(cls, config: TTSConfig):
+        provider = getattr(config, "provider", "windows_sapi").strip().lower()
+        if provider == "windows_sapi":
+            return super().__new__(cls)
+        if provider == "vits":
+            from .vits_backend import VITSTTS
 
-        return VITSTTS(config, fallback_factory=lambda: _WindowsSAPI(config))
-    raise ValueError(f"Unsupported TTS provider: {provider}")
+            return VITSTTS(config, fallback_factory=lambda: _WindowsSAPI(config))
+        raise ValueError(f"Unsupported TTS provider: {provider}")
