@@ -99,9 +99,43 @@ class _FailingEngine:
         pass
 
 
+class _FallbackBackend:
+    def __init__(self) -> None:
+        self.opened = 0
+        self.closed = 0
+        self.spoken: list[str] = []
+
+    def open(self) -> None:
+        self.opened += 1
+
+    def speak(self, text: str, should_stop) -> bool:
+        self.spoken.append(text)
+        return not should_stop()
+
+    def close(self) -> None:
+        self.closed += 1
+
+
 def test_vits_init_failure_with_none_fallback_does_not_raise(tmp_path: Path) -> None:
     config = _config(tmp_path, "  provider: vits\n  fallback: none\n")
     backend = VITSTTS(config.tts, engine=_FailingEngine())
     backend.open()
     assert backend.speak("hello", lambda: False) is False
     backend.close()
+
+
+def test_vits_init_failure_uses_windows_sapi_fallback_without_crashing(tmp_path: Path) -> None:
+    config = _config(tmp_path, "  provider: vits\n  fallback: windows_sapi\n")
+    fallback = _FallbackBackend()
+    backend = VITSTTS(
+        config.tts,
+        engine=_FailingEngine(),
+        fallback_factory=lambda: fallback,
+    )
+
+    backend.open()
+    assert fallback.opened == 1
+    assert backend.speak("hello", lambda: False) is True
+    assert fallback.spoken == ["hello"]
+    backend.close()
+    assert fallback.closed == 1
