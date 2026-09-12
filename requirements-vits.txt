@@ -8,3 +8,5 @@ pypinyin>=0.50
 jieba>=0.42
 cn2an>=0.5
 pyopenjtalk-prebuilt>=0.3.0
+# pyopenjtalk-prebuilt 0.3.0 imports pkg_resources, removed in Setuptools 82.
+setuptools>=77,<82
