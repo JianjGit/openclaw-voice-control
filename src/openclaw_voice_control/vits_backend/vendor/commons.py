@@ -1,19 +1,6 @@
 import math
 import torch
 from torch.nn import functional as F
-import torch.jit
-
-
-def script_method(fn, _rcb=None):
-  return fn
-
-
-def script(obj, optimize=True, _frames_up=0, _rcb=None):
-  return obj
-
-
-torch.jit.script_method = script_method
-torch.jit.script = script
 
 
 def init_weights(m, mean=0.0, std=0.01):
@@ -118,12 +105,6 @@ def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
   return acts
 
 
-def convert_pad_shape(pad_shape):
-  l = pad_shape[::-1]
-  pad_shape = [item for sublist in l for item in sublist]
-  return pad_shape
-
-
 def shift_1d(x):
   x = F.pad(x, convert_pad_shape([[0, 0], [0, 0], [1, 0]]))[:, :, :-1]
   return x
@@ -141,7 +122,6 @@ def generate_path(duration, mask):
   duration: [b, 1, t_x]
   mask: [b, 1, t_y, t_x]
   """
-  device = duration.device
   b, _, t_y, t_x = mask.shape
   cum_duration = torch.cumsum(duration, -1)
   cum_duration_flat = cum_duration.view(b * t_x)
