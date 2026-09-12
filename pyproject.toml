@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "funasr>=1.2",
-  "numpy>=1.26",
+  "numpy>=1.26,<2",
   "openwakeword>=0.6.0",
   "PyYAML>=6.0",
   "sounddevice>=0.5",
@@ -34,6 +34,14 @@ porcupine = [
 tts-cli = [
   "comtypes>=1.4; sys_platform == 'win32'",
   "edge-tts>=6.1",
+]
+vits = [
+  "scipy>=1.11",
+  "Unidecode>=1.3",
+  "pypinyin>=0.50",
+  "jieba>=0.42",
+  "cn2an>=0.5",
+  "pyopenjtalk-prebuilt>=0.3.0",
 ]
 
 [tool.setuptools]
