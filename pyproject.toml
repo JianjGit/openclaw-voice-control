@@ -42,10 +42,11 @@ vits = [
   "jieba>=0.42",
   "cn2an>=0.5",
   "pyopenjtalk-prebuilt>=0.3.0",
+  "setuptools>=77,<82",
 ]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = {"" = "src"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
