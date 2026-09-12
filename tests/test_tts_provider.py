@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 from openclaw_voice_control.config import load_config
 from openclaw_voice_control.tts import WindowsTTS
@@ -27,11 +28,21 @@ def test_default_provider_stays_windows_sapi(tmp_path: Path) -> None:
     assert isinstance(backend, WindowsTTS)
 
 
+class _DummyVITS:
+    def __init__(self, config, *, fallback_factory) -> None:
+        self.config = config
+        self.fallback_factory = fallback_factory
+
+
 def test_vits_provider_dispatches_without_changing_service_wiring(tmp_path: Path) -> None:
     config = _config(tmp_path, "  provider: vits\n  fallback: none\n")
-    # Avoid touching a real checkpoint here; constructor behavior itself is covered
-    # with the injected engines below.
-    assert config.tts.provider == "vits"
+    with patch("openclaw_voice_control.vits_backend.VITSTTS", _DummyVITS):
+        backend = WindowsTTS(config.tts)
+
+    assert isinstance(backend, _DummyVITS)
+    assert backend.config is config.tts
+    fallback = backend.fallback_factory()
+    assert fallback.config is config.tts
 
 
 def test_vits_config_parses_runtime_parameters(tmp_path: Path) -> None:
