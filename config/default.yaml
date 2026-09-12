@@ -57,10 +57,7 @@ wakeword:
   rearm_seconds_after_turn: 0.0
 
 tts:
-  # Preserve upgrade behavior for existing users.
-  provider: windows_sapi  # windows_sapi | vits
-  fallback: windows_sapi  # windows_sapi | none
-  engine: windows_sapi5   # legacy field retained for compatibility
+  engine: windows_sapi5
   voice: zh-CN-HUIHUI
   wake_ack: 我在
   followup_beep_enabled: false
@@ -70,18 +67,6 @@ tts:
   no_speech_beep_enabled: false
   no_speech_sound:
   post_reply_delay: 0.0
-  vits:
-    model_dir:
-    config_file: config.json
-    checkpoint_file: G_953000.pth
-    speaker: ""
-    speaker_id:
-    sample_rate: 22050
-    language: zh
-    device: cpu
-    noise_scale: 0.45
-    noise_scale_w: 0.5
-    length_scale: 1.28
 
 asr:
   provider: funasr
