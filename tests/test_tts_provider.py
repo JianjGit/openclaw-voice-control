@@ -9,7 +9,11 @@ from openclaw_voice_control.vits_backend import VITSTTS
 
 def _config(tmp_path: Path, tts_yaml: str = ""):
     path = tmp_path / "config.yaml"
-    path.write_text("app:\n  log_dir: logs\ntts:\n" + tts_yaml, encoding="utf-8")
+    if tts_yaml:
+        content = "app:\n  log_dir: logs\ntts:\n" + tts_yaml
+    else:
+        content = "app:\n  log_dir: logs\ntts: {}\n"
+    path.write_text(content, encoding="utf-8")
     return load_config(path)
 
 
