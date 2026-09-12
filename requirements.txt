@@ -1,6 +1,6 @@
 # Core runtime dependencies. For development use: pip install -e ".[dev]"
 funasr>=1.2
-numpy>=1.26
+numpy>=1.26,<2
 openwakeword>=0.6.0
 PyYAML>=6.0
 sounddevice>=0.5
@@ -12,3 +12,4 @@ pywin32>=306; sys_platform == "win32"
 # Optional routes are exposed as pyproject extras:
 #   pip install -e ".[porcupine]"
 #   pip install -e ".[tts-cli]"
+#   pip install -e ".[vits]"
