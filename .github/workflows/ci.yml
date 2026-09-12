@@ -23,12 +23,16 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m pip install -e ".[dev,vits]"
           python -m pip check
 
       - name: Verify Python sources compile
         shell: pwsh
         run: python -m compileall -q src/openclaw_voice_control scripts tests examples
+
+      - name: Verify VITS runtime imports
+        shell: pwsh
+        run: python -c "from openclaw_voice_control.vits_backend.vendor import models; from openclaw_voice_control.vits_backend.vendor.text import cleaners; print('VITS imports OK')"
 
       - name: Run hardware-free core tests
         shell: pwsh
