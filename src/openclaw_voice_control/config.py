@@ -100,7 +100,25 @@ class WakewordConfig:
 
 
 @dataclass(slots=True)
+class VITSConfig:
+    model_dir: Path | None = None
+    config_file: str = "config.json"
+    checkpoint_file: str = "G_953000.pth"
+    speaker: str = ""
+    speaker_id: int | None = None
+    sample_rate: int = 22050
+    language: str = "zh"
+    device: str = "cpu"
+    noise_scale: float = 0.45
+    noise_scale_w: float = 0.5
+    length_scale: float = 1.28
+    # Runtime-owned project temp directory; not intended as a user-facing path.
+    temp_dir: Path | None = None
+
+
+@dataclass(slots=True)
 class TTSConfig:
+    # Existing fields remain required/in the same order for source compatibility.
     engine: str
     voice: str
     wake_ack: str
@@ -111,6 +129,10 @@ class TTSConfig:
     no_speech_beep_enabled: bool
     no_speech_sound: str
     post_reply_delay: float
+    # New fields are appended with defaults so older manual TTSConfig(...) calls keep working.
+    provider: str = "windows_sapi"
+    fallback: str = "windows_sapi"
+    vits: VITSConfig = field(default_factory=VITSConfig)
 
 
 @dataclass(slots=True)
@@ -401,6 +423,19 @@ def load_config(config_path: str | Path | None = None, env_path: str | Path | No
     audio = data.get("audio", {})
     wakeword = data.get("wakeword", {})
     tts = data.get("tts", {})
+    if not isinstance(tts, dict):
+        raise ValueError("tts must be a mapping")
+    vits = tts.get("vits", {}) or {}
+    if not isinstance(vits, dict):
+        raise ValueError("tts.vits must be a mapping")
+    tts_provider = _env_or_config("TTS_PROVIDER", tts.get("provider"), "windows_sapi").lower()
+    tts_fallback = _env_or_config("TTS_FALLBACK", tts.get("fallback"), "windows_sapi").lower()
+    if tts_provider not in {"windows_sapi", "vits"}:
+        raise ValueError("tts.provider must be one of: windows_sapi, vits")
+    if tts_fallback not in {"windows_sapi", "none"}:
+        raise ValueError("tts.fallback must be one of: windows_sapi, none")
+    raw_speaker_id = os.getenv("VITS_SPEAKER_ID", vits.get("speaker_id"))
+    vits_speaker_id = None if raw_speaker_id in (None, "") else int(raw_speaker_id)
     asr = data.get("asr", {})
     delivery, delivery_targets = _load_delivery_config(
         data.get("delivery", {}),
@@ -517,6 +552,22 @@ def load_config(config_path: str | Path | None = None, env_path: str | Path | No
             no_speech_beep_enabled=bool(tts.get("no_speech_beep_enabled", False)),
             no_speech_sound=tts.get("no_speech_sound", ""),
             post_reply_delay=float(tts.get("post_reply_delay", 0.0)),
+            provider=tts_provider,
+            fallback=tts_fallback,
+            vits=VITSConfig(
+                model_dir=_env_or_optional_path("VITS_MODEL_DIR", base_dir, vits.get("model_dir")),
+                config_file=str(vits.get("config_file", "config.json")),
+                checkpoint_file=str(vits.get("checkpoint_file", "G_953000.pth")),
+                speaker=_env_or_config("VITS_SPEAKER", vits.get("speaker"), ""),
+                speaker_id=vits_speaker_id,
+                sample_rate=int(vits.get("sample_rate", 22050)),
+                language=str(vits.get("language", "zh")),
+                device=_env_or_config("VITS_DEVICE", vits.get("device"), "cpu"),
+                noise_scale=float(vits.get("noise_scale", 0.45)),
+                noise_scale_w=float(vits.get("noise_scale_w", 0.5)),
+                length_scale=float(vits.get("length_scale", 1.28)),
+                temp_dir=_resolve_path(base_dir, "tmp/tts"),
+            ),
         ),
         asr=ASRConfig(
             provider=asr.get("provider", "funasr"),

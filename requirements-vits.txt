@@ -1,0 +1,12 @@
+# Optional classic multi-speaker VITS runtime dependencies.
+# Install inside this project's own venv, not the system Python:
+#   python -m pip install -r requirements-vits.txt
+-r requirements.txt
+scipy>=1.11
+Unidecode>=1.3
+pypinyin>=0.50
+jieba>=0.42
+cn2an>=0.5
+pyopenjtalk-prebuilt>=0.3.0
+# pyopenjtalk-prebuilt 0.3.0 imports pkg_resources, removed in Setuptools 82.
+setuptools>=77,<82
